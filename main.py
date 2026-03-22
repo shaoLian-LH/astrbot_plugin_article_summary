@@ -33,7 +33,7 @@ CODEX_REASONING_KEYS = (
     "default_reasoning_effort",
 )
 LOG_PREVIEW_LIMIT = 240
-PLUGIN_VERSION = "0.0.4"
+PLUGIN_VERSION = "0.0.5"
 
 
 @register(
@@ -103,6 +103,28 @@ class ArticleSummaryPlugin(Star):
             return
 
         href = self._extract_first_url(reply_payload)
+        if not href:
+            href = self._extract_reply_preview_url(event)
+
+        if not href:
+            reply_id = self._extract_reply_id(reply_payload)
+            if reply_id:
+                logger.info(
+                    "[article-summary] try_get_msg id=%s reply_id=%s",
+                    message_id or "-",
+                    reply_id,
+                )
+                fetched_reply_payload = await self._fetch_reply_payload_by_id(event, reply_id)
+                if fetched_reply_payload is not None:
+                    href = self._extract_first_url(fetched_reply_payload)
+                    logger.info(
+                        "[article-summary] get_msg_result id=%s reply_id=%s url_found=%s payload_preview=%s",
+                        message_id or "-",
+                        reply_id,
+                        bool(href),
+                        self._preview_any(fetched_reply_payload),
+                    )
+
         if not href:
             logger.info(
                 "[article-summary] skip id=%s reason=reply_without_url reply_preview=%s",
@@ -455,6 +477,82 @@ class ArticleSummaryPlugin(Star):
             url = match.group(0).rstrip(".,;!?\")'")
             return url
         return ""
+
+    def _extract_reply_preview_url(self, event: AstrMessageEvent) -> str:
+        for component in self._safe_get_messages(event):
+            if component.__class__.__name__.lower() != "reply":
+                continue
+            for attr in ("message_str", "text", "content", "raw_message"):
+                value = getattr(component, attr, None)
+                if not value:
+                    continue
+                match = URL_PATTERN.search(str(value))
+                if match:
+                    return match.group(0).rstrip(".,;!?\")'")
+
+        outline = self._safe_call(event, "get_message_outline")
+        if outline:
+            match = URL_PATTERN.search(outline)
+            if match:
+                return match.group(0).rstrip(".,;!?\")'")
+
+        return ""
+
+    def _extract_reply_id(self, payload: Any) -> str:
+        if payload is None:
+            return ""
+
+        if isinstance(payload, dict):
+            for key in ("id", "message_id", "msg_id"):
+                value = payload.get(key)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    return text
+            for value in payload.values():
+                nested = self._extract_reply_id(value)
+                if nested:
+                    return nested
+            return ""
+
+        if isinstance(payload, (list, tuple, set)):
+            for item in payload:
+                nested = self._extract_reply_id(item)
+                if nested:
+                    return nested
+            return ""
+
+        for attr in ("id", "message_id", "msg_id"):
+            if hasattr(payload, attr):
+                value = getattr(payload, attr)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    return text
+
+        return ""
+
+    async def _fetch_reply_payload_by_id(self, event: AstrMessageEvent, reply_id: str) -> Optional[Any]:
+        client = getattr(event, "bot", None)
+        if client is None or not hasattr(client, "api"):
+            logger.info("[article-summary] get_msg skipped reason=missing_bot_api reply_id=%s", reply_id)
+            return None
+
+        message_id: Any = int(reply_id) if reply_id.isdigit() else reply_id
+        try:
+            result = await client.api.call_action(
+                "get_msg",
+                message_id=message_id,
+            )
+        except Exception as exc:
+            logger.warning("[article-summary] get_msg failed reply_id=%s err=%s", reply_id, exc)
+            return None
+
+        if isinstance(result, dict) and "data" in result:
+            return result.get("data")
+        return result
 
     def _iter_text_values(self, value: Any, depth: int = 0) -> Iterable[str]:
         if depth > 8 or value is None:

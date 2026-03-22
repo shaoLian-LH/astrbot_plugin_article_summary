@@ -59,3 +59,4 @@
 - 首版仅保证 OneBot v11（AIOCQHTTP）触发结构。
 - 若 Codex 未产出 `article.md`，插件会直接返回错误提示。
 - 触发链路调试日志统一使用前缀 `[article-summary]`，可在 AstrBot 主日志中检索该关键字。
+- 若 reply 段只包含 `id`（不含正文），插件会尝试调用 OneBot `get_msg` 反查原消息再提取链接。
