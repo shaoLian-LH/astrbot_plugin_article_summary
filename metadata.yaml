@@ -1,6 +1,6 @@
 name: astrbot_plugin_article_summary
 display_name: article-summary-reply-link
 desc: 在群聊中处理 @ + 回复链接，生成 article.md 并回传正文/摘要。
-version: v0.0.5
+version: v0.0.6
 author: xuemufan
 repo: https://github.com/shaoLian-LH/astrbot_plugin_article_summary

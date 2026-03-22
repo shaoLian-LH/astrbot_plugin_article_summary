@@ -5,6 +5,12 @@
     "hint": "默认 codex --yolo，会自动把处理提示词追加为最后一个参数",
     "default": "codex --yolo"
   },
+  "codex_non_interactive_cmd": {
+    "type": "string",
+    "description": "检测到 codex 交互命令时自动切换到的非交互命令",
+    "hint": "默认 codex exec --full-auto --skip-git-repo-check",
+    "default": "codex exec --full-auto --skip-git-repo-check"
+  },
   "codex_timeout_seconds": {
     "type": "int",
     "description": "Codex 执行超时时间（秒）",

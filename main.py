@@ -32,8 +32,29 @@ CODEX_REASONING_KEYS = (
     "model_reasoning_effort",
     "default_reasoning_effort",
 )
+CODEX_SUBCOMMANDS = {
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "app-server",
+    "app",
+    "completion",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "resume",
+    "fork",
+    "cloud",
+    "features",
+    "help",
+}
 LOG_PREVIEW_LIMIT = 240
-PLUGIN_VERSION = "0.0.5"
+PLUGIN_VERSION = "0.0.6"
 
 
 @register(
@@ -618,9 +639,15 @@ class ArticleSummaryPlugin(Star):
         if not args:
             return "codex_cmd 为空"
 
-        resolved_args = [prompt if token == "{prompt}" else token for token in args]
-        if "{prompt}" not in args:
-            resolved_args.append(prompt)
+        resolved_args = self._inject_prompt(args, prompt)
+        if self._looks_like_interactive_codex(resolved_args):
+            fallback_args = self._build_non_interactive_codex_args(prompt)
+            logger.info(
+                "[article-summary] codex switch_to_non_interactive original=%s fallback=%s",
+                resolved_args[:-1] if resolved_args else [],
+                fallback_args[:-1] if fallback_args else [],
+            )
+            resolved_args = fallback_args
         logger.info(
             "[article-summary] codex exec cwd=%s cmd=%s prompt=%s",
             run_dir,
@@ -662,6 +689,46 @@ class ArticleSummaryPlugin(Star):
             logger.info("codex stderr tail: %s", err_text[-500:])
 
         return ""
+
+    def _inject_prompt(self, args: list[str], prompt: str) -> list[str]:
+        resolved_args = [prompt if token == "{prompt}" else token for token in args]
+        if "{prompt}" not in args:
+            resolved_args.append(prompt)
+        return resolved_args
+
+    def _looks_like_interactive_codex(self, args: list[str]) -> bool:
+        if not args:
+            return False
+
+        if Path(args[0]).name.lower() != "codex":
+            return False
+
+        first_non_option = ""
+        for token in args[1:]:
+            if token.startswith("-"):
+                continue
+            first_non_option = token
+            break
+
+        if not first_non_option:
+            return True
+
+        return first_non_option not in CODEX_SUBCOMMANDS
+
+    def _build_non_interactive_codex_args(self, prompt: str) -> list[str]:
+        fallback_cmd = self._cfg_str(
+            "codex_non_interactive_cmd",
+            "codex exec --full-auto --skip-git-repo-check",
+        ).strip()
+        if not fallback_cmd:
+            fallback_cmd = "codex exec --full-auto --skip-git-repo-check"
+
+        try:
+            fallback_base = shlex.split(fallback_cmd)
+        except Exception:
+            fallback_base = ["codex", "exec", "--full-auto", "--skip-git-repo-check"]
+
+        return self._inject_prompt(fallback_base, prompt)
 
     def _find_latest_article(self, run_dir: Path) -> Optional[Path]:
         candidates = [
