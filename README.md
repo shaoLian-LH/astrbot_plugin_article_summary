@@ -58,3 +58,4 @@
 - 需要运行环境可直接执行全局 `codex` 命令。
 - 首版仅保证 OneBot v11（AIOCQHTTP）触发结构。
 - 若 Codex 未产出 `article.md`，插件会直接返回错误提示。
+- 触发链路调试日志统一使用前缀 `[article-summary]`，可在 AstrBot 主日志中检索该关键字。

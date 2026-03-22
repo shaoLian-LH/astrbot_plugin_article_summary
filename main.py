@@ -32,37 +32,98 @@ CODEX_REASONING_KEYS = (
     "model_reasoning_effort",
     "default_reasoning_effort",
 )
+LOG_PREVIEW_LIMIT = 240
+PLUGIN_VERSION = "0.0.4"
 
 
 @register(
     "astrbot_plugin_article_summary",
     "xuemufan",
     "在群聊中处理 @+reply+链接，抓取并回传 article.md 与摘要",
-    "0.0.3",
+    PLUGIN_VERSION,
 )
 class ArticleSummaryPlugin(Star):
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config = config or {}
 
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def initialize(self):
+        logger.info(
+            "[article-summary] plugin initialized, version=%s work_root=%s codex_cmd=%s",
+            PLUGIN_VERSION,
+            self._cfg_str("work_root", "article-summary-runs"),
+            self._cfg_str("codex_cmd", "codex --yolo"),
+        )
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=999)
     async def on_group_message(self, event: AstrMessageEvent):
+        message_id = str(getattr(event.message_obj, "message_id", "") or "")
+        platform_name = self._safe_platform_name(event)
+        message_type = self._safe_message_type(event)
+        sender_id = self._safe_call(event, "get_sender_id")
+        group_id = self._safe_call(event, "get_group_id")
+        chain_types = self._message_chain_types(event)
+        logger.info(
+            "[article-summary] recv id=%s platform=%s type=%s group=%s sender=%s chain=%s text=%s",
+            message_id or "-",
+            platform_name or "-",
+            message_type or "-",
+            group_id or "-",
+            sender_id or "-",
+            chain_types or [],
+            self._preview_text(getattr(event, "message_str", "")),
+        )
+
+        if platform_name and platform_name != "aiocqhttp":
+            logger.info(
+                "[article-summary] skip id=%s reason=platform_mismatch platform=%s",
+                message_id or "-",
+                platform_name,
+            )
+            return
+
+        bot_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
+        at_targets = self._collect_at_targets(event)
         if not self._is_at_bot(event):
+            logger.info(
+                "[article-summary] skip id=%s reason=not_at_bot bot_id=%s at_targets=%s",
+                message_id or "-",
+                bot_id or "-",
+                at_targets,
+            )
             return
 
         reply_payload = self._extract_reply_payload(event)
         if reply_payload is None:
+            logger.info(
+                "[article-summary] skip id=%s reason=no_reply_payload raw_type=%s",
+                message_id or "-",
+                type(getattr(event.message_obj, "raw_message", None)).__name__,
+            )
             return
 
         href = self._extract_first_url(reply_payload)
         if not href:
+            logger.info(
+                "[article-summary] skip id=%s reason=reply_without_url reply_preview=%s",
+                message_id or "-",
+                self._preview_any(reply_payload),
+            )
             return
 
+        logger.info(
+            "[article-summary] matched id=%s bot_id=%s at_targets=%s href=%s",
+            message_id or "-",
+            bot_id or "-",
+            at_targets,
+            href,
+        )
         event.stop_event()
+        logger.info("[article-summary] stop_event id=%s", message_id or "-")
         await self._add_recognition_reaction(event)
 
         run_dir = self._create_run_dir(event)
+        logger.info("[article-summary] run_dir id=%s path=%s", message_id or "-", run_dir)
         prompt = self._build_codex_prompt(href)
         self._prepare_codex_workspace_config(run_dir)
 
@@ -76,6 +137,7 @@ class ArticleSummaryPlugin(Star):
         if article_path is None:
             yield event.plain_result("[article-summary] 未找到 article.md，请检查 Codex 输出。")
             return
+        logger.info("[article-summary] article found id=%s path=%s", message_id or "-", article_path)
 
         try:
             article_markdown = article_path.read_text(encoding="utf-8")
@@ -87,14 +149,33 @@ class ArticleSummaryPlugin(Star):
         article_text = self._extract_readable_text(article_markdown)
         if not article_text:
             article_text = article_markdown.strip()
+        logger.info(
+            "[article-summary] article length id=%s markdown=%s plain=%s",
+            message_id or "-",
+            len(article_markdown),
+            len(article_text),
+        )
 
         max_plain_chars = self._cfg_int("max_plain_chars", 260)
         max_summary_chars = self._cfg_int("max_summary_chars", 320)
 
         if len(article_text) > max_plain_chars:
+            logger.info(
+                "[article-summary] summarize id=%s plain_len=%s threshold=%s max_summary=%s",
+                message_id or "-",
+                len(article_text),
+                max_plain_chars,
+                max_summary_chars,
+            )
             outbound_text = await self._summarize_article(event, article_text, max_summary_chars)
             outbound_text = self._clip_text(outbound_text, max_summary_chars)
         else:
+            logger.info(
+                "[article-summary] send_plain id=%s plain_len=%s threshold=%s",
+                message_id or "-",
+                len(article_text),
+                max_plain_chars,
+            )
             outbound_text = self._clip_text(article_text, max_plain_chars)
 
         if not outbound_text:
@@ -104,6 +185,7 @@ class ArticleSummaryPlugin(Star):
             Comp.File(file=str(article_path), name=article_path.name),
         ])
         yield event.plain_result(outbound_text)
+        logger.info("[article-summary] done id=%s", message_id or "-")
 
     def _cfg(self, key: str, default: Any) -> Any:
         config = self.config
@@ -226,14 +308,17 @@ class ArticleSummaryPlugin(Star):
         if isinstance(enabled, str):
             enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
         if not enabled:
+            logger.info("[article-summary] reaction skipped reason=disabled")
             return
 
         emoji_id = self._cfg_str("reaction_emoji_id", "").strip()
         if not emoji_id:
+            logger.info("[article-summary] reaction skipped reason=empty_emoji_id")
             return
 
         message_id = getattr(event.message_obj, "message_id", None)
         if message_id is None:
+            logger.info("[article-summary] reaction skipped reason=missing_message_id")
             return
 
         platform_name_getter = getattr(event, "get_platform_name", None)
@@ -241,12 +326,17 @@ class ArticleSummaryPlugin(Star):
             try:
                 platform_name = str(platform_name_getter() or "")
                 if platform_name and platform_name != "aiocqhttp":
+                    logger.info(
+                        "[article-summary] reaction skipped reason=platform_mismatch platform=%s",
+                        platform_name,
+                    )
                     return
             except Exception:
                 pass
 
         client = getattr(event, "bot", None)
         if client is None or not hasattr(client, "api"):
+            logger.info("[article-summary] reaction skipped reason=missing_bot_api")
             return
 
         try:
@@ -254,6 +344,11 @@ class ArticleSummaryPlugin(Star):
                 "set_msg_emoji_like",
                 message_id=message_id,
                 emoji_id=emoji_id,
+            )
+            logger.info(
+                "[article-summary] reaction set message_id=%s emoji_id=%s",
+                message_id,
+                emoji_id,
             )
         except Exception as exc:
             logger.warning("failed to add reaction for message %s: %s", message_id, exc)
@@ -263,22 +358,7 @@ class ArticleSummaryPlugin(Star):
         if not bot_id:
             return False
 
-        for component in self._safe_get_messages(event):
-            if component.__class__.__name__.lower() != "at":
-                continue
-            target = self._extract_at_target(component)
-            if target and target == bot_id:
-                return True
-
-        raw_message = getattr(event.message_obj, "raw_message", None)
-        for segment in self._iter_message_segments(raw_message):
-            if self._segment_type(segment) != "at":
-                continue
-            target = self._extract_at_target(self._segment_data(segment))
-            if target and target == bot_id:
-                return True
-
-        return False
+        return bot_id in self._collect_at_targets(event)
 
     def _extract_reply_payload(self, event: AstrMessageEvent) -> Optional[Any]:
         raw_message = getattr(event.message_obj, "raw_message", None)
@@ -443,6 +523,12 @@ class ArticleSummaryPlugin(Star):
         resolved_args = [prompt if token == "{prompt}" else token for token in args]
         if "{prompt}" not in args:
             resolved_args.append(prompt)
+        logger.info(
+            "[article-summary] codex exec cwd=%s cmd=%s prompt=%s",
+            run_dir,
+            resolved_args[:-1] if resolved_args else [],
+            self._preview_text(prompt),
+        )
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -564,3 +650,60 @@ class ArticleSummaryPlugin(Star):
     def _safe_segment(self, value: str) -> str:
         safe = re.sub(r"[^0-9A-Za-z._-]", "_", value)
         return safe[:40] or "msg"
+
+    def _safe_call(self, event: AstrMessageEvent, method: str) -> str:
+        fn = getattr(event, method, None)
+        if not callable(fn):
+            return ""
+        try:
+            value = fn()
+            return str(value or "")
+        except Exception:
+            return ""
+
+    def _safe_platform_name(self, event: AstrMessageEvent) -> str:
+        return self._safe_call(event, "get_platform_name")
+
+    def _safe_message_type(self, event: AstrMessageEvent) -> str:
+        return self._safe_call(event, "get_message_type")
+
+    def _message_chain_types(self, event: AstrMessageEvent) -> list[str]:
+        return [message.__class__.__name__ for message in self._safe_get_messages(event)]
+
+    def _collect_at_targets(self, event: AstrMessageEvent) -> list[str]:
+        targets: list[str] = []
+        for component in self._safe_get_messages(event):
+            if component.__class__.__name__.lower() != "at":
+                continue
+            target = self._extract_at_target(component)
+            if target:
+                targets.append(target)
+
+        raw_message = getattr(event.message_obj, "raw_message", None)
+        for segment in self._iter_message_segments(raw_message):
+            if self._segment_type(segment) != "at":
+                continue
+            target = self._extract_at_target(self._segment_data(segment))
+            if target:
+                targets.append(target)
+
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for target in targets:
+            if target in seen:
+                continue
+            seen.add(target)
+            uniq.append(target)
+        return uniq
+
+    def _preview_text(self, text: str) -> str:
+        if not text:
+            return ""
+        collapsed = MULTI_SPACE_PATTERN.sub(" ", text).strip()
+        if len(collapsed) <= LOG_PREVIEW_LIMIT:
+            return collapsed
+        return collapsed[:LOG_PREVIEW_LIMIT] + "..."
+
+    def _preview_any(self, value: Any) -> str:
+        text = str(value)
+        return self._preview_text(text)
