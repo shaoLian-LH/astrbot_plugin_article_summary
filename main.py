@@ -7,11 +7,22 @@ from pathlib import Path
 import re
 import shlex
 from typing import Any, Iterable, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from infrastructure.sqlite_base import DEFAULT_ARTICLE_CACHE_ROOT, DEFAULT_DB_PATH
+from repository.article_repository import (
+    ARTICLE_STATUS_COMPLETED,
+    ARTICLE_STATUS_PROCESSING,
+    ARTICLE_STATUS_STOPPED,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_PROCESSING,
+    TASK_STATUS_STOPPED,
+    ArticleRepository,
+)
 
 try:
     from astrbot.api import AstrBotConfig
@@ -55,7 +66,26 @@ CODEX_SUBCOMMANDS = {
     "help",
 }
 LOG_PREVIEW_LIMIT = 240
-PLUGIN_VERSION = "0.0.7"
+PLUGIN_VERSION = "0.0.9"
+PLUGIN_NAME = "astrbot_plugin_article_summary"
+
+
+def _optional_filter_hook(hook_name: str):
+    def _decorator(func):
+        hook = getattr(filter, hook_name, None)
+        if not callable(hook):
+            return func
+        try:
+            return hook()(func)
+        except TypeError:
+            try:
+                return hook(func)
+            except Exception:
+                return func
+        except Exception:
+            return func
+
+    return _decorator
 
 
 @register(
@@ -65,17 +95,140 @@ PLUGIN_VERSION = "0.0.7"
     PLUGIN_VERSION,
 )
 class ArticleSummaryPlugin(Star):
-    def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
+    def __init__(self, context: Context, config: Optional[AstrBotConfig] = None): # type: ignore
         super().__init__(context)
         self.config = config or {}
+        self.article_repo: Optional[ArticleRepository] = None
+        self._active_codex_tasks: dict[int, dict[str, Any]] = {}
+        self._active_codex_lock = asyncio.Lock()
 
     async def initialize(self):
+        repo = self._ensure_repository()
+        recovered = repo.stop_all_processing("插件启动，已重置残留中的处理中任务。")
         logger.info(
-            "[article-summary] plugin initialized, version=%s work_root=%s codex_cmd=%s",
+            "[article-summary] plugin initialized, version=%s work_root=%s codex_cmd=%s db_path=%s recovered=%s",
             PLUGIN_VERSION,
             self._cfg_str("work_root", "article-summary-runs"),
             self._cfg_str("codex_cmd", "codex --yolo"),
+            self._resolve_db_path(),
+            recovered,
         )
+
+    @_optional_filter_hook("on_plugin_unloaded")
+    async def on_plugin_unloaded(self, metadata=None):
+        plugin_name = str(getattr(metadata, "name", "") or "").strip()
+        if plugin_name and plugin_name != PLUGIN_NAME:
+            return
+        await self._stop_all_running_codex("插件被卸载，已停止正在获取的文章。")
+
+    async def terminate(self):
+        await self._stop_all_running_codex("插件停止，已停止正在获取的文章。")
+
+    @filter.command("获取文章列表", alias={"/获取文章列表"})
+    async def list_article_tasks_command(self, event: AstrMessageEvent):
+        event.stop_event()
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        tasks = self._ensure_repository().list_user_pending_tasks(platform, account_id)
+        if not tasks:
+            yield event.plain_result("[article-summary] 当前没有正在获取/已停止的文章。")
+            return
+
+        lines = ["[article-summary] 获取文章列表："]
+        for task in tasks[:30]:
+            task_id = int(task.get("id") or 0)
+            status = str(task.get("status") or "")
+            status_label = self._task_status_label(status)
+            url = str(task.get("source_url") or task.get("normalized_url") or "").strip()
+            updated_at = self._format_ts(int(task.get("updated_at") or 0))
+            line = f"{task_id}. [{status_label}] {self._preview_text(url)}（更新时间: {updated_at}）"
+            if status == TASK_STATUS_STOPPED:
+                line += f" 可继续：/继续获取文章 {task_id}"
+            lines.append(line)
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("继续获取文章", alias={"/继续获取文章"})
+    async def resume_article_command(self, event: AstrMessageEvent, item_id: str = ""):
+        event.stop_event()
+        task_id = self._parse_int(item_id)
+        if task_id <= 0:
+            yield event.plain_result("[article-summary] 用法：/继续获取文章 <列表项id>")
+            return
+
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        repo = self._ensure_repository()
+        task = repo.get_task_by_id_for_owner(task_id, platform, account_id)
+        if task is None:
+            yield event.plain_result("[article-summary] 未找到该列表项，或你没有权限操作它。")
+            return
+
+        task_status = str(task.get("status") or "")
+        if task_status == TASK_STATUS_COMPLETED:
+            article = repo.get_article_by_id(int(task.get("article_id") or 0))
+            if article and str(article.get("status") or "") == ARTICLE_STATUS_COMPLETED:
+                async for item in self._emit_cached_article_result(event, article):
+                    yield item
+                return
+            yield event.plain_result("[article-summary] 该列表项已完成。")
+            return
+        if task_status == TASK_STATUS_PROCESSING:
+            yield event.plain_result("[article-summary] 该列表项正在处理中，请稍候。")
+            return
+        if task_status != TASK_STATUS_STOPPED:
+            yield event.plain_result(f"[article-summary] 当前状态不支持继续：{task_status or '-'}")
+            return
+
+        article_id = int(task.get("article_id") or 0)
+        article = repo.get_article_by_id(article_id)
+        if article and str(article.get("status") or "") == ARTICLE_STATUS_COMPLETED:
+            repo.complete_tasks_for_article(article_id)
+            async for item in self._emit_cached_article_result(event, article):
+                yield item
+            return
+
+        session_id = str(task.get("session_id") or task.get("last_session_id") or "").strip()
+        if not session_id:
+            yield event.plain_result("[article-summary] 该任务没有可恢复的 session_id，无法继续。")
+            return
+
+        run_dir = self._resolve_run_dir(str(task.get("run_dir") or ""))
+        if run_dir is None:
+            run_dir = self._create_task_run_dir(event, task_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self._prepare_codex_workspace_config(run_dir)
+
+        resume_args, resume_error = self._build_resume_codex_args(session_id)
+        if resume_error:
+            yield event.plain_result(f"[article-summary] 无法构建继续命令: {resume_error}")
+            return
+
+        repo.update_task_status(
+            task_id,
+            status=TASK_STATUS_PROCESSING,
+            run_dir=str(run_dir),
+            session_id=session_id,
+            pid=0,
+            last_error="",
+        )
+        repo.set_article_processing(article_id, run_dir=str(run_dir), session_id=session_id)
+
+        async for item in self._execute_article_task(
+            event=event,
+            task_id=task_id,
+            article_id=article_id,
+            source_url=str(task.get("source_url") or task.get("normalized_url") or ""),
+            run_dir=run_dir,
+            codex_args=resume_args,
+            prompt_preview=f"resume {session_id}",
+        ):
+            yield item
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=999)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -165,71 +318,8 @@ class ArticleSummaryPlugin(Star):
         event.stop_event()
         logger.info("[article-summary] stop_event id=%s", message_id or "-")
         await self._add_recognition_reaction(event)
-
-        run_dir = self._create_run_dir(event)
-        logger.info("[article-summary] run_dir id=%s path=%s", message_id or "-", run_dir)
-        prompt = self._build_codex_prompt(href)
-        self._prepare_codex_workspace_config(run_dir)
-
-        codex_error = await self._run_codex(event, run_dir, prompt)
-        if codex_error:
-            logger.warning("codex failed: %s", codex_error)
-            yield event.plain_result(f"[article-summary] 处理失败: {codex_error}")
-            return
-
-        article_path = self._find_latest_article(run_dir)
-        if article_path is None:
-            yield event.plain_result("[article-summary] 未找到 article.md，请检查 Codex 输出。")
-            return
-        logger.info("[article-summary] article found id=%s path=%s", message_id or "-", article_path)
-
-        try:
-            article_markdown = article_path.read_text(encoding="utf-8")
-        except Exception as exc:
-            logger.exception("failed to read article.md: %s", exc)
-            yield event.plain_result(f"[article-summary] 读取 article.md 失败: {exc}")
-            return
-
-        article_text = self._extract_readable_text(article_markdown)
-        if not article_text:
-            article_text = article_markdown.strip()
-        logger.info(
-            "[article-summary] article length id=%s markdown=%s plain=%s",
-            message_id or "-",
-            len(article_markdown),
-            len(article_text),
-        )
-
-        max_plain_chars = self._cfg_int("max_plain_chars", 260)
-        max_summary_chars = self._cfg_int("max_summary_chars", 320)
-
-        if len(article_text) > max_plain_chars:
-            logger.info(
-                "[article-summary] summarize id=%s plain_len=%s threshold=%s max_summary=%s",
-                message_id or "-",
-                len(article_text),
-                max_plain_chars,
-                max_summary_chars,
-            )
-            outbound_text = await self._summarize_article(event, article_text, max_summary_chars)
-            outbound_text = self._clip_text(outbound_text, max_summary_chars)
-        else:
-            logger.info(
-                "[article-summary] send_plain id=%s plain_len=%s threshold=%s",
-                message_id or "-",
-                len(article_text),
-                max_plain_chars,
-            )
-            outbound_text = self._clip_text(article_text, max_plain_chars)
-
-        if not outbound_text:
-            outbound_text = "article.md 已生成，但未能提取可发送文本。"
-
-        yield event.chain_result([
-            Comp.File(file=str(article_path), name=article_path.name),
-        ])
-        yield event.plain_result(outbound_text)
-        logger.info("[article-summary] done id=%s", message_id or "-")
+        async for item in self._handle_article_request(event, href):
+            yield item
 
     def _cfg(self, key: str, default: Any) -> Any:
         config = self.config
@@ -255,6 +345,423 @@ class ArticleSummaryPlugin(Star):
         if value is None:
             return default
         return str(value)
+
+    def _resolve_db_path(self) -> str:
+        raw = self._cfg_str("db_path", "").strip()
+        if not raw:
+            return DEFAULT_DB_PATH
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return str(path)
+
+    def _resolve_article_cache_root(self) -> Path:
+        raw = self._cfg_str("article_cache_root", "").strip()
+        path = Path(raw).expanduser() if raw else Path(DEFAULT_ARTICLE_CACHE_ROOT)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
+
+    def _ensure_repository(self) -> ArticleRepository:
+        if self.article_repo is None:
+            self.article_repo = ArticleRepository(db_path=self._resolve_db_path())
+        return self.article_repo
+
+    def _resolve_user_scope(self, event: AstrMessageEvent) -> tuple[str, str]:
+        platform = self._safe_platform_name(event) or "unknown"
+        account_id = self._safe_call(event, "get_sender_id").strip()
+        return platform, account_id
+
+    def _parse_int(self, value: Any) -> int:
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return 0
+
+    def _task_status_label(self, status: str) -> str:
+        mapping = {
+            TASK_STATUS_PROCESSING: "处理中",
+            TASK_STATUS_STOPPED: "停止",
+            TASK_STATUS_COMPLETED: "完成",
+        }
+        return mapping.get(status, status or "-")
+
+    def _format_ts(self, ts: int) -> str:
+        if ts <= 0:
+            return "-"
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "-"
+
+    def _resolve_run_dir(self, run_dir: str) -> Optional[Path]:
+        text = str(run_dir or "").strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
+
+    def _create_task_run_dir(self, event: AstrMessageEvent, task_id: int) -> Path:
+        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
+        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
+        if not work_root.is_absolute():
+            work_root = Path.cwd() / work_root
+
+        message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = work_root / f"{timestamp}-t{max(0, task_id)}-{message_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    def _normalize_url(self, href: str) -> str:
+        text = str(href or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = urlsplit(text)
+            scheme = (parsed.scheme or "https").lower()
+            netloc = parsed.netloc.lower()
+            path = parsed.path or "/"
+            if path != "/":
+                path = re.sub(r"/+$", "", path) or "/"
+            query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            query = urlencode(sorted(query_pairs), doseq=True) if query_pairs else ""
+            return urlunsplit((scheme, netloc, path, query, ""))
+        except Exception:
+            return text
+
+    def _build_codex_args(self, prompt: str) -> tuple[list[str], str]:
+        cmd_text = self._cfg_str("codex_cmd", "codex --yolo").strip() or "codex --yolo"
+        try:
+            args = shlex.split(cmd_text)
+        except Exception as exc:
+            return [], f"codex_cmd 配置无法解析: {exc}"
+        if not args:
+            return [], "codex_cmd 为空"
+
+        resolved_args = self._inject_prompt(args, prompt)
+        if self._looks_like_interactive_codex(resolved_args):
+            fallback_args = self._build_non_interactive_codex_args(prompt)
+            logger.info(
+                "[article-summary] codex switch_to_non_interactive original=%s fallback=%s",
+                resolved_args[:-1] if resolved_args else [],
+                fallback_args[:-1] if fallback_args else [],
+            )
+            resolved_args = fallback_args
+        return resolved_args, ""
+
+    def _build_resume_codex_args(self, session_id: str) -> tuple[list[str], str]:
+        template = self._cfg_str(
+            "codex_resume_cmd_template",
+            "codex --yolo resume {session} 继续",
+        ).strip()
+        if not template:
+            template = "codex --yolo resume {session} 继续"
+
+        try:
+            args = shlex.split(template)
+        except Exception as exc:
+            return [], str(exc)
+        if not args:
+            return [], "继续命令为空"
+
+        resolved: list[str] = []
+        replaced = False
+        for token in args:
+            if token in ("{session}", "${session}", "$session"):
+                resolved.append(session_id)
+                replaced = True
+                continue
+            resolved.append(token)
+        if not replaced:
+            resolved.append(session_id)
+        return resolved, ""
+
+    async def _handle_article_request(self, event: AstrMessageEvent, href: str):
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        repo = self._ensure_repository()
+        normalized_url = self._normalize_url(href)
+        if not normalized_url:
+            yield event.plain_result("[article-summary] 链接解析失败。")
+            return
+
+        article = repo.create_or_get_article(normalized_url, href)
+        article_id = int(article.get("id") or 0)
+        if article_id <= 0:
+            yield event.plain_result("[article-summary] 文章记录创建失败。")
+            return
+
+        article_status = str(article.get("status") or "")
+        if article_status == ARTICLE_STATUS_COMPLETED and (
+            str(article.get("article_markdown") or "").strip()
+            or str(article.get("article_file_path") or "").strip()
+        ):
+            repo.ensure_user_completed_task(
+                platform=platform,
+                account_id=account_id,
+                article_id=article_id,
+                run_dir=str(article.get("last_run_dir") or ""),
+                session_id=str(article.get("last_session_id") or ""),
+            )
+            async for item in self._emit_cached_article_result(event, article):
+                yield item
+            return
+
+        latest_task = repo.get_latest_task_for_article(article_id)
+        if latest_task is not None:
+            latest_status = str(latest_task.get("status") or "")
+            if latest_status in (TASK_STATUS_PROCESSING, TASK_STATUS_STOPPED):
+                user_task = repo.ensure_user_task_for_article(
+                    platform=platform,
+                    account_id=account_id,
+                    article_id=article_id,
+                    status=latest_status,
+                    run_dir=str(latest_task.get("run_dir") or ""),
+                    session_id=str(latest_task.get("session_id") or ""),
+                    pid=int(latest_task.get("pid") or 0),
+                    last_error=str(latest_task.get("last_error") or ""),
+                )
+                task_id = int(user_task.get("id") or 0)
+                if latest_status == TASK_STATUS_PROCESSING:
+                    yield event.plain_result(
+                        f"[article-summary] 该链接正在获取中（列表项 {task_id}），请稍后查看 /获取文章列表。"
+                    )
+                else:
+                    yield event.plain_result(
+                        f"[article-summary] 该链接当前为停止状态（列表项 {task_id}），"
+                        f"可执行 /继续获取文章 {task_id}。"
+                    )
+                return
+
+        task = repo.ensure_user_task_for_article(
+            platform=platform,
+            account_id=account_id,
+            article_id=article_id,
+            status=TASK_STATUS_PROCESSING,
+        )
+        task_id = int(task.get("id") or 0)
+        run_dir = self._create_task_run_dir(event, task_id)
+        self._prepare_codex_workspace_config(run_dir)
+
+        repo.update_task_status(
+            task_id,
+            status=TASK_STATUS_PROCESSING,
+            run_dir=str(run_dir),
+            session_id="",
+            pid=0,
+            last_error="",
+        )
+        repo.set_article_processing(article_id, run_dir=str(run_dir), session_id="")
+
+        prompt = self._build_codex_prompt(href)
+        codex_args, codex_args_error = self._build_codex_args(prompt)
+        if codex_args_error:
+            self._mark_task_stopped(task_id, article_id, codex_args_error, "")
+            yield event.plain_result(f"[article-summary] 处理失败: {codex_args_error}")
+            return
+
+        async for item in self._execute_article_task(
+            event=event,
+            task_id=task_id,
+            article_id=article_id,
+            source_url=href,
+            run_dir=run_dir,
+            codex_args=codex_args,
+            prompt_preview=prompt,
+        ):
+            yield item
+
+    async def _execute_article_task(
+        self,
+        event: AstrMessageEvent,
+        task_id: int,
+        article_id: int,
+        source_url: str,
+        run_dir: Path,
+        codex_args: list[str],
+        prompt_preview: str,
+    ):
+        codex_error, session_id = await self._run_codex(
+            event=event,
+            run_dir=run_dir,
+            resolved_args=codex_args,
+            task_id=task_id,
+            article_id=article_id,
+            prompt_preview=prompt_preview,
+        )
+        if codex_error:
+            self._mark_task_stopped(task_id, article_id, codex_error, session_id)
+            yield event.plain_result(
+                f"[article-summary] 处理失败: {codex_error}\n"
+                f"可执行 /继续获取文章 {task_id} 继续。"
+            )
+            return
+
+        article_path = self._find_latest_article(run_dir)
+        if article_path is None:
+            error_text = "未找到 article.md，请检查 Codex 输出。"
+            self._mark_task_stopped(task_id, article_id, error_text, session_id)
+            yield event.plain_result(f"[article-summary] {error_text}")
+            return
+
+        try:
+            article_markdown = article_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            error_text = f"读取 article.md 失败: {exc}"
+            logger.exception("failed to read article.md: %s", exc)
+            self._mark_task_stopped(task_id, article_id, error_text, session_id)
+            yield event.plain_result(f"[article-summary] {error_text}")
+            return
+
+        article_text = self._extract_readable_text(article_markdown)
+        if not article_text:
+            article_text = article_markdown.strip()
+
+        max_plain_chars = self._cfg_int("max_plain_chars", 260)
+        max_summary_chars = self._cfg_int("max_summary_chars", 320)
+
+        if len(article_text) > max_plain_chars:
+            summary_text = await self._summarize_article(event, article_text, max_summary_chars)
+            outbound_text = self._clip_text(summary_text, max_summary_chars)
+        else:
+            outbound_text = self._clip_text(article_text, max_plain_chars)
+
+        if not outbound_text:
+            outbound_text = "article.md 已生成，但未能提取可发送文本。"
+
+        cache_path = self._write_article_cache_file(article_id, article_markdown)
+        if cache_path is None:
+            cache_path = article_path
+
+        repo = self._ensure_repository()
+        repo.set_article_completed(
+            article_id=article_id,
+            article_markdown=article_markdown,
+            article_plain_text=article_text,
+            summary_text=outbound_text,
+            article_file_path=str(cache_path),
+            run_dir=str(run_dir),
+            session_id=session_id,
+        )
+        repo.complete_tasks_for_article(
+            article_id=article_id,
+            run_dir=str(run_dir),
+            session_id=session_id,
+        )
+
+        yield event.chain_result([
+            Comp.File(file=str(cache_path), name=cache_path.name),
+        ])
+        yield event.plain_result(outbound_text)
+        logger.info(
+            "[article-summary] done task=%s article=%s source=%s",
+            task_id,
+            article_id,
+            source_url,
+        )
+
+    def _mark_task_stopped(self, task_id: int, article_id: int, error_text: str, session_id: str) -> None:
+        repo = self._ensure_repository()
+        repo.update_task_status(
+            task_id,
+            status=TASK_STATUS_STOPPED,
+            session_id=session_id if session_id else None,
+            pid=0,
+            last_error=error_text,
+        )
+        repo.stop_tasks_for_article(article_id, error_text, session_id=session_id)
+        repo.set_article_stopped(article_id, error_text, session_id=session_id)
+
+    async def _emit_cached_article_result(self, event: AstrMessageEvent, article: dict):
+        article_id = int(article.get("id") or 0)
+        article_file = self._ensure_cached_article_file(article)
+        if article_file is not None and article_file.is_file():
+            yield event.chain_result([
+                Comp.File(file=str(article_file), name=article_file.name),
+            ])
+
+        text = str(article.get("summary_text") or "").strip()
+        if not text:
+            plain_text = str(article.get("article_plain_text") or "").strip()
+            if plain_text:
+                text = self._clip_text(plain_text, self._cfg_int("max_plain_chars", 260))
+            else:
+                markdown = str(article.get("article_markdown") or "").strip()
+                if markdown:
+                    derived = self._extract_readable_text(markdown) or markdown
+                    text = self._clip_text(derived, self._cfg_int("max_summary_chars", 320))
+        if not text:
+            text = "文章已缓存，但未提取到可发送文本。"
+        yield event.plain_result(text)
+        logger.info("[article-summary] hit cache article=%s", article_id)
+
+    def _ensure_cached_article_file(self, article: dict) -> Optional[Path]:
+        path_text = str(article.get("article_file_path") or "").strip()
+        if path_text:
+            path = Path(path_text).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            if path.is_file():
+                return path
+
+        article_id = int(article.get("id") or 0)
+        markdown = str(article.get("article_markdown") or "")
+        if article_id <= 0 or not markdown:
+            return None
+        return self._write_article_cache_file(article_id, markdown)
+
+    def _write_article_cache_file(self, article_id: int, article_markdown: str) -> Optional[Path]:
+        try:
+            root = self._resolve_article_cache_root()
+            path = root / f"article-{article_id}" / "article.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(article_markdown, encoding="utf-8")
+            return path
+        except Exception as exc:
+            logger.warning("[article-summary] write cache article failed article=%s err=%s", article_id, exc)
+            return None
+
+    async def _stop_all_running_codex(self, reason: str) -> None:
+        repo = self._ensure_repository()
+        async with self._active_codex_lock:
+            snapshot = list(self._active_codex_tasks.items())
+
+        for task_id, payload in snapshot:
+            process = payload.get("process")
+            article_id = int(payload.get("article_id") or 0)
+            session_id = str(payload.get("session_id") or "")
+            try:
+                if process is not None and getattr(process, "returncode", None) is None:
+                    process.kill()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning("[article-summary] kill codex process failed task=%s err=%s", task_id, exc)
+
+            if task_id > 0:
+                repo.update_task_status(
+                    int(task_id),
+                    status=TASK_STATUS_STOPPED,
+                    pid=0,
+                    session_id=session_id if session_id else None,
+                    last_error=reason,
+                )
+            if article_id > 0:
+                repo.stop_tasks_for_article(article_id, reason, session_id=session_id)
+                repo.set_article_stopped(article_id, reason, session_id=session_id)
+
+        async with self._active_codex_lock:
+            self._active_codex_tasks.clear()
+
+        repo.stop_all_processing(reason)
 
     def _prepare_codex_workspace_config(self, run_dir: Path) -> None:
         default_model = self._cfg_str("default_codex_model", "").strip()
@@ -617,57 +1124,39 @@ class ArticleSummaryPlugin(Star):
             )
 
     def _create_run_dir(self, event: AstrMessageEvent) -> Path:
-        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
-        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
-        if not work_root.is_absolute():
-            work_root = Path.cwd() / work_root
+        return self._create_task_run_dir(event, 0)
 
-        message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = work_root / f"{timestamp}-{message_id}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return run_dir
-
-    async def _run_codex(self, event: AstrMessageEvent, run_dir: Path, prompt: str) -> str:
-        cmd_text = self._cfg_str("codex_cmd", "codex --yolo").strip() or "codex --yolo"
+    async def _run_codex(
+        self,
+        event: AstrMessageEvent,
+        run_dir: Path,
+        resolved_args: list[str],
+        task_id: int,
+        article_id: int,
+        prompt_preview: str = "",
+    ) -> tuple[str, str]:
         timeout_seconds = self._cfg_int("codex_timeout_seconds", 900)
         report_seconds = max(0, self._cfg_int("codex_progress_report_seconds", 120))
         poll_seconds = max(1, self._cfg_int("codex_progress_poll_seconds", 5))
-
-        try:
-            args = shlex.split(cmd_text)
-        except Exception as exc:
-            return f"codex_cmd 配置无法解析: {exc}"
-
-        if not args:
-            return "codex_cmd 为空"
-
-        resolved_args = self._inject_prompt(args, prompt)
-        if self._looks_like_interactive_codex(resolved_args):
-            fallback_args = self._build_non_interactive_codex_args(prompt)
-            logger.info(
-                "[article-summary] codex switch_to_non_interactive original=%s fallback=%s",
-                resolved_args[:-1] if resolved_args else [],
-                fallback_args[:-1] if fallback_args else [],
-            )
-            resolved_args = fallback_args
         logger.info(
             "[article-summary] codex exec cwd=%s cmd=%s prompt=%s",
             run_dir,
             resolved_args[:-1] if resolved_args else [],
-            self._preview_text(prompt),
+            self._preview_text(prompt_preview),
         )
 
         stdout_path = run_dir / "codex.stdout.log"
         stderr_path = run_dir / "codex.stderr.log"
         rollout_tracker = self._create_rollout_tracker(run_dir)
         progress_tick = 0
+        session_id = ""
+        repo = self._ensure_repository()
 
         try:
             stdout_fp = stdout_path.open("wb")
             stderr_fp = stderr_path.open("wb")
         except Exception as exc:
-            return f"无法创建 codex 日志文件: {exc}"
+            return f"无法创建 codex 日志文件: {exc}", session_id
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -679,67 +1168,119 @@ class ArticleSummaryPlugin(Star):
         except FileNotFoundError:
             stdout_fp.close()
             stderr_fp.close()
-            return "未找到 codex 命令，请确认 codex 已全局安装。"
+            return "未找到 codex 命令，请确认 codex 已全局安装。", session_id
         except Exception as exc:
             stdout_fp.close()
             stderr_fp.close()
-            return f"启动 codex 失败: {exc}"
+            return f"启动 codex 失败: {exc}", session_id
+
+        async with self._active_codex_lock:
+            self._active_codex_tasks[task_id] = {
+                "process": process,
+                "article_id": article_id,
+                "run_dir": str(run_dir),
+                "session_id": "",
+            }
+        repo.update_task_status(
+            task_id,
+            status=TASK_STATUS_PROCESSING,
+            run_dir=str(run_dir),
+            pid=int(getattr(process, "pid", 0) or 0),
+            last_error="",
+        )
 
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         next_report_at = started_at + report_seconds if report_seconds > 0 else float("inf")
 
         timed_out = False
-        while process.returncode is None:
-            elapsed = loop.time() - started_at
-            if elapsed > timeout_seconds:
-                timed_out = True
-                process.kill()
-                break
+        try:
+            while process.returncode is None:
+                elapsed = loop.time() - started_at
+                if elapsed > timeout_seconds:
+                    timed_out = True
+                    process.kill()
+                    break
+
+                await self._scan_rollout_tracker(rollout_tracker)
+                tracker_session_id = str(rollout_tracker.get("session_id") or "").strip()
+                if tracker_session_id and tracker_session_id != session_id:
+                    if not self._is_rollout_tracker_bound_to_run(rollout_tracker):
+                        logger.warning(
+                            "[article-summary] skip session bind task=%s session=%s reason=rollout_not_bound_to_run",
+                            task_id,
+                            tracker_session_id,
+                        )
+                        tracker_session_id = ""
+                if tracker_session_id and tracker_session_id != session_id:
+                    session_id = tracker_session_id
+                    async with self._active_codex_lock:
+                        active = self._active_codex_tasks.get(task_id)
+                        if isinstance(active, dict):
+                            active["session_id"] = session_id
+                    repo.update_task_status(
+                        task_id,
+                        status=TASK_STATUS_PROCESSING,
+                        session_id=session_id,
+                        pid=int(getattr(process, "pid", 0) or 0),
+                    )
+                    repo.set_article_processing(article_id, run_dir=str(run_dir), session_id=session_id)
+
+                if report_seconds > 0 and loop.time() >= next_report_at:
+                    progress_tick += 1
+                    elapsed_seconds = int(loop.time() - started_at)
+                    progress_text = self._build_rollout_progress_text(
+                        rollout_tracker,
+                        elapsed_seconds,
+                        progress_tick,
+                    )
+                    await self._send_progress_message(event, progress_text)
+                    next_report_at += report_seconds
+
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=poll_seconds)
+                except asyncio.TimeoutError:
+                    continue
+
+            if process.returncode is None:
+                await process.wait()
 
             await self._scan_rollout_tracker(rollout_tracker)
+            tracker_session_id = str(rollout_tracker.get("session_id") or "").strip()
+            if tracker_session_id and not self._is_rollout_tracker_bound_to_run(rollout_tracker):
+                tracker_session_id = ""
+            if tracker_session_id and not session_id:
+                session_id = tracker_session_id
 
-            if report_seconds > 0 and loop.time() >= next_report_at:
-                progress_tick += 1
-                elapsed_seconds = int(loop.time() - started_at)
-                progress_text = self._build_rollout_progress_text(
-                    rollout_tracker,
-                    elapsed_seconds,
-                    progress_tick,
-                )
-                await self._send_progress_message(event, progress_text)
-                next_report_at += report_seconds
+            if timed_out:
+                return f"codex 执行超时（>{timeout_seconds}s）", session_id
 
+            out_text = self._tail_file_text(stdout_path, 800)
+            err_text = self._tail_file_text(stderr_path, 800)
+
+            if process.returncode != 0:
+                tail = err_text or out_text or "无输出"
+                if len(tail) > 500:
+                    tail = tail[-500:]
+                return f"codex 退出码 {process.returncode}: {tail}", session_id
+
+            if out_text:
+                logger.info("codex stdout tail: %s", out_text[-500:])
+            if err_text:
+                logger.info("codex stderr tail: %s", err_text[-500:])
+
+            return "", session_id
+        finally:
             try:
-                await asyncio.wait_for(process.wait(), timeout=poll_seconds)
-            except asyncio.TimeoutError:
-                continue
-
-        if process.returncode is None:
-            await process.wait()
-        stdout_fp.close()
-        stderr_fp.close()
-
-        await self._scan_rollout_tracker(rollout_tracker)
-
-        if timed_out:
-            return f"codex 执行超时（>{timeout_seconds}s）"
-
-        out_text = self._tail_file_text(stdout_path, 800)
-        err_text = self._tail_file_text(stderr_path, 800)
-
-        if process.returncode != 0:
-            tail = err_text or out_text or "无输出"
-            if len(tail) > 500:
-                tail = tail[-500:]
-            return f"codex 退出码 {process.returncode}: {tail}"
-
-        if out_text:
-            logger.info("codex stdout tail: %s", out_text[-500:])
-        if err_text:
-            logger.info("codex stderr tail: %s", err_text[-500:])
-
-        return ""
+                stdout_fp.close()
+            except Exception:
+                pass
+            try:
+                stderr_fp.close()
+            except Exception:
+                pass
+            async with self._active_codex_lock:
+                self._active_codex_tasks.pop(task_id, None)
 
     def _inject_prompt(self, args: list[str], prompt: str) -> list[str]:
         resolved_args = [prompt if token == "{prompt}" else token for token in args]
@@ -790,6 +1331,7 @@ class ArticleSummaryPlugin(Star):
             "run_dir": str(run_dir),
             "created_at": datetime.now().timestamp(),
             "rollout_file": None,
+            "session_id": "",
             "meta_cache": {},
             "offset": 0,
             "pending": b"",
@@ -807,6 +1349,7 @@ class ArticleSummaryPlugin(Star):
             rollout_file = self._find_rollout_file_for_run(tracker)
             if rollout_file is not None:
                 tracker["rollout_file"] = rollout_file
+                tracker["session_id"] = self._extract_session_id_from_rollout_file(rollout_file)
                 tracker["offset"] = 0
                 tracker["pending"] = b""
                 logger.info("[article-summary] rollout bind file=%s", rollout_file)
@@ -858,8 +1401,15 @@ class ArticleSummaryPlugin(Star):
                 continue
             self._consume_rollout_line(tracker, raw)
 
+    def _extract_session_id_from_rollout_file(self, rollout_file: str) -> str:
+        name = Path(rollout_file).name
+        match = re.match(r"^rollout-(.+?)\.jsonl$", name)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip()
+
     def _find_rollout_file_for_run(self, tracker: dict[str, Any]) -> Optional[str]:
-        sessions_root = Path(tracker.get("sessions_root"))
+        sessions_root = Path(tracker.get("sessions_root")) # type: ignore
         run_dir = str(tracker.get("run_dir", ""))
         if not sessions_root.exists():
             return None
@@ -880,11 +1430,9 @@ class ArticleSummaryPlugin(Star):
         candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
         created_at = float(tracker.get("created_at", 0) or 0)
 
-        recent_candidates: list[Path] = []
         for path in candidates[:30]:
             if created_at and path.stat().st_mtime < (created_at - 180):
                 continue
-            recent_candidates.append(path)
             path_key = str(path)
             cwd = meta_cache.get(path_key, "")
             if not cwd:
@@ -894,11 +1442,15 @@ class ArticleSummaryPlugin(Star):
             if cwd and cwd == run_dir:
                 return path_key
 
-        if not recent_candidates:
-            return None
+        return None
 
-        freshest = recent_candidates[0]
-        return str(freshest)
+    def _is_rollout_tracker_bound_to_run(self, tracker: dict[str, Any]) -> bool:
+        rollout_file = str(tracker.get("rollout_file") or "").strip()
+        run_dir = str(tracker.get("run_dir") or "").strip()
+        if not rollout_file or not run_dir:
+            return False
+        cwd = self._read_rollout_meta_cwd(Path(rollout_file))
+        return bool(cwd and cwd == run_dir)
 
     def _read_rollout_meta_cwd(self, path: Path) -> str:
         try:
@@ -926,6 +1478,18 @@ class ArticleSummaryPlugin(Star):
             return
 
         item_type = str(data.get("type", "") or "")
+        if item_type == "session_meta":
+            payload = data.get("payload", {})
+            session_id = (
+                payload.get("session_id")
+                or payload.get("id")
+                or data.get("session_id")
+                or ""
+            )
+            if session_id:
+                tracker["session_id"] = str(session_id)
+            return
+
         if item_type == "event_msg":
             payload = data.get("payload", {})
             event_type = str(payload.get("type", "unknown") or "unknown")

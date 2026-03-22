@@ -11,6 +11,12 @@
     "hint": "默认 codex exec --full-auto --skip-git-repo-check",
     "default": "codex exec --full-auto --skip-git-repo-check"
   },
+  "codex_resume_cmd_template": {
+    "type": "string",
+    "description": "继续获取文章时使用的 Codex 命令模板，支持 {session}",
+    "hint": "默认 codex --yolo resume {session} 继续",
+    "default": "codex --yolo resume {session} 继续"
+  },
   "codex_sessions_root": {
     "type": "string",
     "description": "Codex 会话目录根路径，用于读取 rollout 进度",
@@ -66,6 +72,16 @@
     "type": "string",
     "description": "运行目录根路径（相对路径会基于 AstrBot 运行时目录解析）",
     "default": "article-summary-runs"
+  },
+  "db_path": {
+    "type": "string",
+    "description": "SQLite 数据库路径（留空使用插件默认 plugin_data 路径）",
+    "default": ""
+  },
+  "article_cache_root": {
+    "type": "string",
+    "description": "文章缓存文件目录（留空使用插件默认 plugin_data 路径）",
+    "default": ""
   },
   "codex_prompt_template": {
     "type": "text",
