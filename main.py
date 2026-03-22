@@ -38,7 +38,7 @@ CODEX_REASONING_KEYS = (
     "astrbot_plugin_article_summary",
     "xuemufan",
     "在群聊中处理 @+reply+链接，抓取并回传 article.md 与摘要",
-    "0.0.2",
+    "0.0.3",
 )
 class ArticleSummaryPlugin(Star):
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
