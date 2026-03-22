@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import re
 import shlex
@@ -9,7 +10,7 @@ from typing import Any, Iterable, Optional
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 try:
@@ -54,7 +55,7 @@ CODEX_SUBCOMMANDS = {
     "help",
 }
 LOG_PREVIEW_LIMIT = 240
-PLUGIN_VERSION = "0.0.6"
+PLUGIN_VERSION = "0.0.7"
 
 
 @register(
@@ -170,7 +171,7 @@ class ArticleSummaryPlugin(Star):
         prompt = self._build_codex_prompt(href)
         self._prepare_codex_workspace_config(run_dir)
 
-        codex_error = await self._run_codex(run_dir, prompt)
+        codex_error = await self._run_codex(event, run_dir, prompt)
         if codex_error:
             logger.warning("codex failed: %s", codex_error)
             yield event.plain_result(f"[article-summary] 处理失败: {codex_error}")
@@ -627,9 +628,11 @@ class ArticleSummaryPlugin(Star):
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
-    async def _run_codex(self, run_dir: Path, prompt: str) -> str:
+    async def _run_codex(self, event: AstrMessageEvent, run_dir: Path, prompt: str) -> str:
         cmd_text = self._cfg_str("codex_cmd", "codex --yolo").strip() or "codex --yolo"
         timeout_seconds = self._cfg_int("codex_timeout_seconds", 900)
+        report_seconds = max(0, self._cfg_int("codex_progress_report_seconds", 120))
+        poll_seconds = max(1, self._cfg_int("codex_progress_poll_seconds", 5))
 
         try:
             args = shlex.split(cmd_text)
@@ -655,27 +658,75 @@ class ArticleSummaryPlugin(Star):
             self._preview_text(prompt),
         )
 
+        stdout_path = run_dir / "codex.stdout.log"
+        stderr_path = run_dir / "codex.stderr.log"
+        rollout_tracker = self._create_rollout_tracker(run_dir)
+        progress_tick = 0
+
+        try:
+            stdout_fp = stdout_path.open("wb")
+            stderr_fp = stderr_path.open("wb")
+        except Exception as exc:
+            return f"无法创建 codex 日志文件: {exc}"
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *resolved_args,
                 cwd=str(run_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=stdout_fp,
+                stderr=stderr_fp,
             )
         except FileNotFoundError:
+            stdout_fp.close()
+            stderr_fp.close()
             return "未找到 codex 命令，请确认 codex 已全局安装。"
         except Exception as exc:
+            stdout_fp.close()
+            stderr_fp.close()
             return f"启动 codex 失败: {exc}"
 
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.communicate()
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        next_report_at = started_at + report_seconds if report_seconds > 0 else float("inf")
+
+        timed_out = False
+        while process.returncode is None:
+            elapsed = loop.time() - started_at
+            if elapsed > timeout_seconds:
+                timed_out = True
+                process.kill()
+                break
+
+            await self._scan_rollout_tracker(rollout_tracker)
+
+            if report_seconds > 0 and loop.time() >= next_report_at:
+                progress_tick += 1
+                elapsed_seconds = int(loop.time() - started_at)
+                progress_text = self._build_rollout_progress_text(
+                    rollout_tracker,
+                    elapsed_seconds,
+                    progress_tick,
+                )
+                await self._send_progress_message(event, progress_text)
+                next_report_at += report_seconds
+
+            try:
+                await asyncio.wait_for(process.wait(), timeout=poll_seconds)
+            except asyncio.TimeoutError:
+                continue
+
+        if process.returncode is None:
+            await process.wait()
+        stdout_fp.close()
+        stderr_fp.close()
+
+        await self._scan_rollout_tracker(rollout_tracker)
+
+        if timed_out:
             return f"codex 执行超时（>{timeout_seconds}s）"
 
-        out_text = stdout.decode("utf-8", errors="ignore").strip()
-        err_text = stderr.decode("utf-8", errors="ignore").strip()
+        out_text = self._tail_file_text(stdout_path, 800)
+        err_text = self._tail_file_text(stderr_path, 800)
 
         if process.returncode != 0:
             tail = err_text or out_text or "无输出"
@@ -729,6 +780,233 @@ class ArticleSummaryPlugin(Star):
             fallback_base = ["codex", "exec", "--full-auto", "--skip-git-repo-check"]
 
         return self._inject_prompt(fallback_base, prompt)
+
+    def _create_rollout_tracker(self, run_dir: Path) -> dict[str, Any]:
+        sessions_root = Path(
+            self._cfg_str("codex_sessions_root", "~/.codex/sessions").strip() or "~/.codex/sessions",
+        ).expanduser()
+        return {
+            "sessions_root": sessions_root,
+            "run_dir": str(run_dir),
+            "created_at": datetime.now().timestamp(),
+            "rollout_file": None,
+            "meta_cache": {},
+            "offset": 0,
+            "pending": b"",
+            "event_msg_counts": {},
+            "response_item_counts": {},
+            "function_call_counts": {},
+            "web_search_call_count": 0,
+            "last_event_msg_type": "",
+            "last_web_action": "",
+        }
+
+    async def _scan_rollout_tracker(self, tracker: dict[str, Any]) -> None:
+        rollout_file = tracker.get("rollout_file")
+        if not rollout_file:
+            rollout_file = self._find_rollout_file_for_run(tracker)
+            if rollout_file is not None:
+                tracker["rollout_file"] = rollout_file
+                tracker["offset"] = 0
+                tracker["pending"] = b""
+                logger.info("[article-summary] rollout bind file=%s", rollout_file)
+
+        if rollout_file is None:
+            return
+
+        path = Path(rollout_file)
+        if not path.is_file():
+            tracker["rollout_file"] = None
+            tracker["offset"] = 0
+            tracker["pending"] = b""
+            return
+
+        max_bytes = max(4096, self._cfg_int("codex_rollout_read_max_bytes", 524288))
+
+        try:
+            file_size = path.stat().st_size
+            offset = int(tracker.get("offset", 0) or 0)
+            if offset > file_size:
+                offset = 0
+                tracker["pending"] = b""
+            to_read = file_size - offset
+            if to_read <= 0:
+                return
+            if to_read > max_bytes:
+                to_read = max_bytes
+            with path.open("rb") as fp:
+                fp.seek(offset)
+                chunk = fp.read(to_read)
+                tracker["offset"] = fp.tell()
+        except Exception as exc:
+            logger.warning("[article-summary] rollout scan failed file=%s err=%s", path, exc)
+            return
+
+        if not chunk:
+            return
+
+        pending: bytes = tracker.get("pending", b"") or b""
+        blob = pending + chunk
+        lines = blob.split(b"\n")
+        tracker["pending"] = lines[-1]
+        if len(tracker["pending"]) > 1024 * 1024:
+            tracker["pending"] = b""
+
+        for raw in lines[:-1]:
+            raw = raw.strip()
+            if not raw:
+                continue
+            self._consume_rollout_line(tracker, raw)
+
+    def _find_rollout_file_for_run(self, tracker: dict[str, Any]) -> Optional[str]:
+        sessions_root = Path(tracker.get("sessions_root"))
+        run_dir = str(tracker.get("run_dir", ""))
+        if not sessions_root.exists():
+            return None
+
+        meta_cache: dict[str, str] = tracker.get("meta_cache", {})
+        candidates: list[Path] = []
+        now = datetime.now()
+        for day_offset in (0, -1):
+            day = now + timedelta(days=day_offset)
+            day_dir = sessions_root / day.strftime("%Y") / day.strftime("%m") / day.strftime("%d")
+            if not day_dir.is_dir():
+                continue
+            candidates.extend(day_dir.glob("rollout-*.jsonl"))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        created_at = float(tracker.get("created_at", 0) or 0)
+
+        recent_candidates: list[Path] = []
+        for path in candidates[:30]:
+            if created_at and path.stat().st_mtime < (created_at - 180):
+                continue
+            recent_candidates.append(path)
+            path_key = str(path)
+            cwd = meta_cache.get(path_key, "")
+            if not cwd:
+                cwd = self._read_rollout_meta_cwd(path)
+                if cwd:
+                    meta_cache[path_key] = cwd
+            if cwd and cwd == run_dir:
+                return path_key
+
+        if not recent_candidates:
+            return None
+
+        freshest = recent_candidates[0]
+        return str(freshest)
+
+    def _read_rollout_meta_cwd(self, path: Path) -> str:
+        try:
+            with path.open("r", encoding="utf-8") as fp:
+                for _ in range(8):
+                    line = fp.readline()
+                    if not line:
+                        break
+                    data = json.loads(line)
+                    if data.get("type") != "session_meta":
+                        continue
+                    payload = data.get("payload", {})
+                    cwd = payload.get("cwd")
+                    if cwd:
+                        return str(cwd)
+        except Exception:
+            return ""
+        return ""
+
+    def _consume_rollout_line(self, tracker: dict[str, Any], raw_line: bytes) -> None:
+        try:
+            text = raw_line.decode("utf-8", errors="ignore")
+            data = json.loads(text)
+        except Exception:
+            return
+
+        item_type = str(data.get("type", "") or "")
+        if item_type == "event_msg":
+            payload = data.get("payload", {})
+            event_type = str(payload.get("type", "unknown") or "unknown")
+            self._inc_counter(tracker, "event_msg_counts", event_type)
+            tracker["last_event_msg_type"] = event_type
+            return
+
+        if item_type != "response_item":
+            return
+
+        payload = data.get("payload", {})
+        payload_type = str(payload.get("type", "unknown") or "unknown")
+        self._inc_counter(tracker, "response_item_counts", payload_type)
+
+        if payload_type == "function_call":
+            name = str(payload.get("name", "unknown") or "unknown")
+            self._inc_counter(tracker, "function_call_counts", name)
+            return
+
+        if payload_type == "web_search_call":
+            tracker["web_search_call_count"] = int(tracker.get("web_search_call_count", 0) or 0) + 1
+            action = payload.get("action", {})
+            if isinstance(action, dict):
+                tracker["last_web_action"] = str(action.get("type", "") or "")
+
+    def _inc_counter(self, tracker: dict[str, Any], key: str, sub_key: str) -> None:
+        counters = tracker.get(key)
+        if not isinstance(counters, dict):
+            counters = {}
+            tracker[key] = counters
+        counters[sub_key] = int(counters.get(sub_key, 0) or 0) + 1
+
+    def _build_rollout_progress_text(
+        self,
+        tracker: dict[str, Any],
+        elapsed_seconds: int,
+        progress_tick: int,
+    ) -> str:
+        minutes = elapsed_seconds // 60
+        seconds = elapsed_seconds % 60
+        rollout_file = tracker.get("rollout_file")
+        rollout_name = Path(rollout_file).name if rollout_file else "未绑定"
+        web_search_count = int(tracker.get("web_search_call_count", 0) or 0)
+        function_call_counts: dict[str, int] = tracker.get("function_call_counts", {})
+        function_call_total = sum(int(v) for v in function_call_counts.values())
+        token_count = int((tracker.get("event_msg_counts", {}) or {}).get("token_count", 0) or 0)
+        last_event_msg_type = str(tracker.get("last_event_msg_type", "") or "-")
+        last_web_action = str(tracker.get("last_web_action", "") or "-")
+
+        top_functions = sorted(
+            function_call_counts.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:2]
+        top_function_text = ", ".join(f"{name}:{count}" for name, count in top_functions) or "-"
+
+        return (
+            "[article-summary] 处理中 "
+            f"{minutes}m{seconds:02d}s (第{progress_tick}次进度播报)："
+            f"web_search_call={web_search_count}, function_call={function_call_total}, "
+            f"token_count={token_count}, last_event={last_event_msg_type}, "
+            f"last_web_action={last_web_action}, top_functions={top_function_text}, "
+            f"rollout={rollout_name}"
+        )
+
+    async def _send_progress_message(self, event: AstrMessageEvent, text: str) -> None:
+        try:
+            await event.send(MessageChain([Comp.Plain(text)]))
+        except Exception as exc:
+            logger.warning("[article-summary] send progress failed: %s", exc)
+
+    def _tail_file_text(self, path: Path, max_chars: int) -> str:
+        if not path.is_file():
+            return ""
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
+        if len(text) <= max_chars:
+            return text.strip()
+        return text[-max_chars:].strip()
 
     def _find_latest_article(self, run_dir: Path) -> Optional[Path]:
         candidates = [

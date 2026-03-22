@@ -11,6 +11,27 @@
     "hint": "默认 codex exec --full-auto --skip-git-repo-check",
     "default": "codex exec --full-auto --skip-git-repo-check"
   },
+  "codex_sessions_root": {
+    "type": "string",
+    "description": "Codex 会话目录根路径，用于读取 rollout 进度",
+    "hint": "默认 ~/.codex/sessions",
+    "default": "~/.codex/sessions"
+  },
+  "codex_progress_report_seconds": {
+    "type": "int",
+    "description": "Codex 执行超过该秒数后开始进度播报，并按该间隔持续播报",
+    "default": 120
+  },
+  "codex_progress_poll_seconds": {
+    "type": "int",
+    "description": "轮询 Codex 进程与 rollout 文件的间隔秒数",
+    "default": 5
+  },
+  "codex_rollout_read_max_bytes": {
+    "type": "int",
+    "description": "每次扫描 rollout jsonl 时最多读取的字节数（分段读取大文件）",
+    "default": 524288
+  },
   "codex_timeout_seconds": {
     "type": "int",
     "description": "Codex 执行超时时间（秒）",

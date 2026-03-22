@@ -29,6 +29,10 @@
 
 - `codex_cmd`：默认 `codex --yolo`
 - `codex_non_interactive_cmd`：默认 `codex exec --full-auto --skip-git-repo-check`
+- `codex_sessions_root`：默认 `~/.codex/sessions`
+- `codex_progress_report_seconds`：默认 `120`
+- `codex_progress_poll_seconds`：默认 `5`
+- `codex_rollout_read_max_bytes`：默认 `524288`
 - `codex_timeout_seconds`：默认 `900`
 - `default_codex_model`：默认 `gpt-5.4`
 - `default_codex_reasoning_effort`：默认 `medium`
@@ -62,3 +66,4 @@
 - 触发链路调试日志统一使用前缀 `[article-summary]`，可在 AstrBot 主日志中检索该关键字。
 - 若 reply 段只包含 `id`（不含正文），插件会尝试调用 OneBot `get_msg` 反查原消息再提取链接。
 - 若 `codex_cmd` 是交互式（如 `codex --yolo`），插件会自动切换到 `codex_non_interactive_cmd` 执行，避免 `stdin is not a terminal`。
+- 若 Codex 执行超过 `codex_progress_report_seconds`，插件会分段扫描 rollout jsonl 并播报进度（如 `web_search_call`、`function_call` 次数）。
