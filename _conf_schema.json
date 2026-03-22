@@ -1,0 +1,72 @@
+{
+  "codex_cmd": {
+    "type": "string",
+    "description": "用于抓取文章的 Codex 命令",
+    "hint": "默认 codex --yolo，会自动把处理提示词追加为最后一个参数",
+    "default": "codex --yolo"
+  },
+  "codex_timeout_seconds": {
+    "type": "int",
+    "description": "Codex 执行超时时间（秒）",
+    "default": 900
+  },
+  "default_codex_model": {
+    "type": "string",
+    "description": "默认 Codex 模型（当工作空间 .codex/config.toml 未提供 model 时生效）",
+    "default": "gpt-5.4"
+  },
+  "default_codex_reasoning_effort": {
+    "type": "string",
+    "description": "默认思考深度（low/medium/high/xhigh；当工作空间配置未提供时生效）",
+    "default": "medium"
+  },
+  "workspace_codex_config_path": {
+    "type": "string",
+    "description": "工作空间 Codex 配置文件路径（相对路径基于 AstrBot 运行目录）",
+    "default": ".codex/config.toml"
+  },
+  "enable_reaction": {
+    "type": "bool",
+    "description": "识别到 @+reply+链接 后，是否给该消息添加表情标签",
+    "default": true
+  },
+  "reaction_emoji_id": {
+    "type": "string",
+    "description": "OneBot set_msg_emoji_like 使用的 emoji_id，留空则不打标签",
+    "default": "128077"
+  },
+  "work_root": {
+    "type": "string",
+    "description": "运行目录根路径（相对路径会基于 AstrBot 运行时目录解析）",
+    "default": "article-summary-runs"
+  },
+  "codex_prompt_template": {
+    "type": "text",
+    "description": "传给 Codex 的提示词模板，支持 {href} 占位符",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "default": "你需要使用 $url-to-markdown 技能去获取 {href} 的内容，如果原文是英文则还需要使用 $translate-non-zh-article 技能去进行翻译"
+  },
+  "max_plain_chars": {
+    "type": "int",
+    "description": "article.md 纯文本不超过该长度时直接回传正文",
+    "default": 260
+  },
+  "max_summary_chars": {
+    "type": "int",
+    "description": "需要总结时，摘要最大字符数",
+    "default": 320
+  },
+  "max_summary_input_chars": {
+    "type": "int",
+    "description": "发送给 LLM 的文章最大输入字符数",
+    "default": 12000
+  },
+  "summary_prompt_template": {
+    "type": "text",
+    "description": "摘要提示词模板，支持 {max_chars} 和 {content}",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "default": "请你将以下文章总结为不超过{max_chars}字的中文摘要，保留核心观点和关键信息。只输出摘要正文，不要输出标题或额外说明。\n\n{content}"
+  }
+}
