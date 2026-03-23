@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.0.11 - 2026-03-23
+
+### Added
+- 为 `article_tasks` 增加并持久化 rollout 统计字段：工具调用次数、额外搜索次数、累计 token、进度播报次数。
+- 新增任务统计落库方法 `update_task_rollout_stats`，用于总结过程中的实时指标记录。
+
+### Changed
+- 进度消息格式调整为面向用户的中文模板：展示已耗时分钟数、播报次数、工具调用、搜索次数、token 与原文地址。
+- rollout 解析逻辑增强：结束前会 drain/flush pending 缓冲，降低尾部事件丢失概率。
+- token 统计来源改为读取 rollout `event_msg.token_count.info.total_token_usage.total_tokens` 的最新值。
+
 ## v0.0.10 - 2026-03-23
 
 ### Fixed
