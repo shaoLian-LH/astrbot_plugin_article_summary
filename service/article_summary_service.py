@@ -576,6 +576,7 @@ class ArticleSummaryService(Star):
             resolved_args=codex_args,
             task_id=task_id,
             article_id=article_id,
+            article_url=source_url,
             prompt_preview=prompt_preview,
         )
         if codex_error:
@@ -1116,6 +1117,7 @@ class ArticleSummaryService(Star):
         resolved_args: list[str],
         task_id: int,
         article_id: int,
+        article_url: str = "",
         prompt_preview: str = "",
     ) -> tuple[str, str]:
         timeout_seconds = self._cfg_int("codex_timeout_seconds", 900)
@@ -1133,12 +1135,14 @@ class ArticleSummaryService(Star):
         rollout_tracker = self._create_rollout_tracker(run_dir)
         progress_tick = 0
         session_id = ""
+        normalized_article_url = str(article_url or "").strip()
         repo = self._ensure_repository()
 
         try:
             stdout_fp = stdout_path.open("wb")
             stderr_fp = stderr_path.open("wb")
         except Exception as exc:
+            self._persist_task_rollout_stats(task_id, rollout_tracker, progress_tick)
             return f"无法创建 codex 日志文件: {exc}", session_id
 
         try:
@@ -1151,10 +1155,12 @@ class ArticleSummaryService(Star):
         except FileNotFoundError:
             stdout_fp.close()
             stderr_fp.close()
+            self._persist_task_rollout_stats(task_id, rollout_tracker, progress_tick)
             return "未找到 codex 命令，请确认 codex 已全局安装。", session_id
         except Exception as exc:
             stdout_fp.close()
             stderr_fp.close()
+            self._persist_task_rollout_stats(task_id, rollout_tracker, progress_tick)
             return f"启动 codex 失败: {exc}", session_id
 
         async with self._active_codex_lock:
@@ -1216,6 +1222,7 @@ class ArticleSummaryService(Star):
                         rollout_tracker,
                         elapsed_seconds,
                         progress_tick,
+                        normalized_article_url,
                     )
                     await self._send_progress_message(event, progress_text)
                     next_report_at += report_seconds
@@ -1228,12 +1235,14 @@ class ArticleSummaryService(Star):
             if process.returncode is None:
                 await process.wait()
 
-            await self._scan_rollout_tracker(rollout_tracker)
+            await self._drain_rollout_tracker(rollout_tracker)
             tracker_session_id = str(rollout_tracker.get("session_id") or "").strip()
             if tracker_session_id and not self._is_rollout_tracker_bound_to_run(rollout_tracker):
                 tracker_session_id = ""
             if tracker_session_id and not session_id:
                 session_id = tracker_session_id
+
+            self._persist_task_rollout_stats(task_id, rollout_tracker, progress_tick)
 
             if timed_out:
                 return f"codex 执行超时（>{timeout_seconds}s）", session_id
@@ -1333,8 +1342,7 @@ class ArticleSummaryService(Star):
             "response_item_counts": {},
             "function_call_counts": {},
             "web_search_call_count": 0,
-            "last_event_msg_type": "",
-            "last_web_action": "",
+            "token_count": 0,
         }
 
     async def _scan_rollout_tracker(self, tracker: dict[str, Any]) -> None:
@@ -1394,6 +1402,78 @@ class ArticleSummaryService(Star):
             if not raw:
                 continue
             self._consume_rollout_line(tracker, raw)
+
+    async def _drain_rollout_tracker(self, tracker: dict[str, Any], max_idle_rounds: int = 3) -> None:
+        idle_rounds = 0
+        idle_limit = max(1, int(max_idle_rounds))
+        stable_eof_pending_rounds = 0
+        last_eof_pending_state: tuple[int, int, int] | None = None
+
+        while True:
+            before_offset = int(tracker.get("offset", 0) or 0)
+            before_pending = tracker.get("pending", b"") or b""
+            before_pending_len = len(before_pending) if isinstance(before_pending, (bytes, bytearray)) else 0
+
+            await self._scan_rollout_tracker(tracker)
+            rollout_file = tracker.get("rollout_file")
+            if not rollout_file:
+                self._flush_rollout_tracker_pending(tracker)
+                return
+
+            path = Path(str(rollout_file))
+            if not path.is_file():
+                self._flush_rollout_tracker_pending(tracker)
+                return
+
+            try:
+                file_size = int(path.stat().st_size)
+            except Exception:
+                self._flush_rollout_tracker_pending(tracker)
+                return
+
+            after_offset = int(tracker.get("offset", 0) or 0)
+            pending = tracker.get("pending", b"") or b""
+            pending_len = len(pending) if isinstance(pending, (bytes, bytearray)) else 0
+
+            if after_offset >= file_size:
+                eof_pending_state = (after_offset, file_size, pending_len)
+                if eof_pending_state == last_eof_pending_state:
+                    stable_eof_pending_rounds += 1
+                else:
+                    last_eof_pending_state = eof_pending_state
+                    stable_eof_pending_rounds = 1
+                if stable_eof_pending_rounds >= idle_limit:
+                    if pending_len > 0:
+                        self._flush_rollout_tracker_pending(tracker)
+                    return
+                await asyncio.sleep(0.05)
+                continue
+
+            stable_eof_pending_rounds = 0
+            last_eof_pending_state = None
+
+            progressed = (after_offset > before_offset) or (pending_len != before_pending_len)
+            if progressed:
+                idle_rounds = 0
+                continue
+
+            idle_rounds += 1
+            if idle_rounds >= idle_limit:
+                self._flush_rollout_tracker_pending(tracker)
+                return
+
+            await asyncio.sleep(0.05)
+
+    def _flush_rollout_tracker_pending(self, tracker: dict[str, Any]) -> None:
+        pending = tracker.get("pending", b"") or b""
+        if not isinstance(pending, (bytes, bytearray)):
+            tracker["pending"] = b""
+            return
+        raw = bytes(pending).strip()
+        tracker["pending"] = b""
+        if not raw:
+            return
+        self._consume_rollout_line(tracker, raw)
 
     def _extract_session_id_from_rollout_file(self, rollout_file: str) -> str:
         name = Path(rollout_file).name
@@ -1488,7 +1568,10 @@ class ArticleSummaryService(Star):
             payload = data.get("payload", {})
             event_type = str(payload.get("type", "unknown") or "unknown")
             self._inc_counter(tracker, "event_msg_counts", event_type)
-            tracker["last_event_msg_type"] = event_type
+            if event_type == "token_count":
+                total_tokens = self._extract_total_tokens_from_event_msg(payload)
+                if total_tokens is not None:
+                    tracker["token_count"] = max(0, int(total_tokens))
             return
 
         if item_type != "response_item":
@@ -1505,9 +1588,24 @@ class ArticleSummaryService(Star):
 
         if payload_type == "web_search_call":
             tracker["web_search_call_count"] = int(tracker.get("web_search_call_count", 0) or 0) + 1
-            action = payload.get("action", {})
-            if isinstance(action, dict):
-                tracker["last_web_action"] = str(action.get("type", "") or "")
+
+    def _extract_total_tokens_from_event_msg(self, payload: Any) -> Optional[int]:
+        if not isinstance(payload, dict):
+            return None
+
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return None
+
+        total_usage = info.get("total_token_usage")
+        if not isinstance(total_usage, dict):
+            return None
+
+        total_tokens = total_usage.get("total_tokens")
+        try:
+            return int(total_tokens)
+        except (TypeError, ValueError):
+            return None
 
     def _inc_counter(self, tracker: dict[str, Any], key: str, sub_key: str) -> None:
         counters = tracker.get(key)
@@ -1516,37 +1614,60 @@ class ArticleSummaryService(Star):
             tracker[key] = counters
         counters[sub_key] = int(counters.get(sub_key, 0) or 0) + 1
 
+    def _collect_rollout_stats(self, tracker: dict[str, Any], progress_tick: int) -> dict[str, int]:
+        function_call_counts: dict[str, int] = tracker.get("function_call_counts", {})
+        function_call_total = sum(int(value) for value in function_call_counts.values())
+        web_search_count = int(tracker.get("web_search_call_count", 0) or 0)
+        token_count = int(tracker.get("token_count", 0) or 0)
+        return {
+            "function_call_count": max(0, function_call_total),
+            "web_search_call_count": max(0, web_search_count),
+            "token_count": max(0, token_count),
+            "progress_report_count": max(0, int(progress_tick)),
+        }
+
+    def _persist_task_rollout_stats(
+        self,
+        task_id: int,
+        tracker: dict[str, Any],
+        progress_tick: int,
+    ) -> None:
+        if task_id <= 0:
+            return
+        stats = self._collect_rollout_stats(tracker, progress_tick)
+        repo = self._ensure_repository()
+        try:
+            repo.update_task_rollout_stats(
+                task_id=task_id,
+                function_call_count=stats["function_call_count"],
+                web_search_call_count=stats["web_search_call_count"],
+                token_count=stats["token_count"],
+                progress_report_count=stats["progress_report_count"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "[article-summary] persist rollout stats failed task=%s err=%s",
+                task_id,
+                exc,
+            )
+
     def _build_rollout_progress_text(
         self,
         tracker: dict[str, Any],
         elapsed_seconds: int,
         progress_tick: int,
+        article_url: str,
     ) -> str:
         minutes = elapsed_seconds // 60
-        seconds = elapsed_seconds % 60
-        rollout_file = tracker.get("rollout_file")
-        rollout_name = Path(rollout_file).name if rollout_file else "未绑定"
-        web_search_count = int(tracker.get("web_search_call_count", 0) or 0)
-        function_call_counts: dict[str, int] = tracker.get("function_call_counts", {})
-        function_call_total = sum(int(v) for v in function_call_counts.values())
-        token_count = int((tracker.get("event_msg_counts", {}) or {}).get("token_count", 0) or 0)
-        last_event_msg_type = str(tracker.get("last_event_msg_type", "") or "-")
-        last_web_action = str(tracker.get("last_web_action", "") or "-")
-
-        top_functions = sorted(
-            function_call_counts.items(),
-            key=lambda item: item[1],
-            reverse=True,
-        )[:2]
-        top_function_text = ", ".join(f"{name}:{count}" for name, count in top_functions) or "-"
+        stats = self._collect_rollout_stats(tracker, progress_tick)
+        normalized_url = str(article_url or "").strip() or "-"
 
         return (
-            "[article-summary] 处理中 "
-            f"{minutes}m{seconds:02d}s (第{progress_tick}次进度播报)："
-            f"web_search_call={web_search_count}, function_call={function_call_total}, "
-            f"token_count={token_count}, last_event={last_event_msg_type}, "
-            f"last_web_action={last_web_action}, top_functions={top_function_text}, "
-            f"rollout={rollout_name}"
+            f"[文章总结中] 已过 {minutes} 分钟（第{progress_tick}次进度播报）：\n"
+            f"1. 工具调用次数：{stats['function_call_count']}\n"
+            f"2. 已进行额外搜索：{stats['web_search_call_count']}\n"
+            f"3. 已用 token：{stats['token_count']}\n\n"
+            f"原文章地址：{normalized_url}"
         )
 
     async def _send_progress_message(self, event: AstrMessageEvent, text: str) -> None:

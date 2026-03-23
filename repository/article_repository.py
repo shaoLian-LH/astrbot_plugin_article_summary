@@ -51,6 +51,10 @@ class ArticleRepository(SQLiteRepositoryBase):
                 run_dir TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL DEFAULT '',
                 pid INTEGER NOT NULL DEFAULT 0,
+                function_call_count INTEGER NOT NULL DEFAULT 0,
+                web_search_call_count INTEGER NOT NULL DEFAULT 0,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                progress_report_count INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -69,6 +73,20 @@ class ArticleRepository(SQLiteRepositoryBase):
             conn.execute("ALTER TABLE articles ADD COLUMN completed_at INTEGER NOT NULL DEFAULT 0")
         if not self._column_exists(conn, "article_tasks", "pid"):
             conn.execute("ALTER TABLE article_tasks ADD COLUMN pid INTEGER NOT NULL DEFAULT 0")
+        if not self._column_exists(conn, "article_tasks", "function_call_count"):
+            conn.execute(
+                "ALTER TABLE article_tasks ADD COLUMN function_call_count INTEGER NOT NULL DEFAULT 0",
+            )
+        if not self._column_exists(conn, "article_tasks", "web_search_call_count"):
+            conn.execute(
+                "ALTER TABLE article_tasks ADD COLUMN web_search_call_count INTEGER NOT NULL DEFAULT 0",
+            )
+        if not self._column_exists(conn, "article_tasks", "token_count"):
+            conn.execute("ALTER TABLE article_tasks ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0")
+        if not self._column_exists(conn, "article_tasks", "progress_report_count"):
+            conn.execute(
+                "ALTER TABLE article_tasks ADD COLUMN progress_report_count INTEGER NOT NULL DEFAULT 0",
+            )
 
     def _ensure_indexes(self, conn) -> None:
         conn.executescript(
@@ -243,7 +261,8 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 """
                 SELECT id, platform, account_id, article_id, status, run_dir,
-                       session_id, pid, last_error, created_at, updated_at
+                       session_id, pid, function_call_count, web_search_call_count,
+                       token_count, progress_report_count, last_error, created_at, updated_at
                 FROM article_tasks
                 WHERE id = ?
                 """,
@@ -256,7 +275,8 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 """
                 SELECT t.id, t.platform, t.account_id, t.article_id, t.status, t.run_dir,
-                       t.session_id, t.pid, t.last_error, t.created_at, t.updated_at,
+                       t.session_id, t.pid, t.function_call_count, t.web_search_call_count,
+                       t.token_count, t.progress_report_count, t.last_error, t.created_at, t.updated_at,
                        a.normalized_url, a.source_url, a.status AS article_status,
                        a.last_session_id, a.last_error AS article_last_error,
                        a.article_markdown, a.summary_text, a.article_file_path
@@ -281,7 +301,8 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 f"""
                 SELECT id, platform, account_id, article_id, status, run_dir,
-                       session_id, pid, last_error, created_at, updated_at
+                       session_id, pid, function_call_count, web_search_call_count,
+                       token_count, progress_report_count, last_error, created_at, updated_at
                 FROM article_tasks
                 WHERE article_id = ? AND status IN ({placeholders})
                 ORDER BY updated_at DESC, id DESC
@@ -301,7 +322,8 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 """
                 SELECT id, platform, account_id, article_id, status, run_dir,
-                       session_id, pid, last_error, created_at, updated_at
+                       session_id, pid, function_call_count, web_search_call_count,
+                       token_count, progress_report_count, last_error, created_at, updated_at
                 FROM article_tasks
                 WHERE platform = ?
                   AND account_id = ?
@@ -324,7 +346,8 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 """
                 SELECT id, platform, account_id, article_id, status, run_dir,
-                       session_id, pid, last_error, created_at, updated_at
+                       session_id, pid, function_call_count, web_search_call_count,
+                       token_count, progress_report_count, last_error, created_at, updated_at
                 FROM article_tasks
                 WHERE platform = ?
                   AND account_id = ?
@@ -373,6 +396,10 @@ class ArticleRepository(SQLiteRepositoryBase):
         run_dir: Optional[str] = None,
         session_id: Optional[str] = None,
         pid: Optional[int] = None,
+        function_call_count: Optional[int] = None,
+        web_search_call_count: Optional[int] = None,
+        token_count: Optional[int] = None,
+        progress_report_count: Optional[int] = None,
         last_error: Optional[str] = None,
     ) -> None:
         now = self._now()
@@ -388,6 +415,18 @@ class ArticleRepository(SQLiteRepositoryBase):
         if pid is not None:
             fields.append("pid = ?")
             params.append(int(pid))
+        if function_call_count is not None:
+            fields.append("function_call_count = ?")
+            params.append(max(0, int(function_call_count)))
+        if web_search_call_count is not None:
+            fields.append("web_search_call_count = ?")
+            params.append(max(0, int(web_search_call_count)))
+        if token_count is not None:
+            fields.append("token_count = ?")
+            params.append(max(0, int(token_count)))
+        if progress_report_count is not None:
+            fields.append("progress_report_count = ?")
+            params.append(max(0, int(progress_report_count)))
         if last_error is not None:
             fields.append("last_error = ?")
             params.append(last_error)
@@ -398,6 +437,36 @@ class ArticleRepository(SQLiteRepositoryBase):
             conn.execute(
                 f"UPDATE article_tasks SET {set_sql} WHERE id = ?",
                 params,
+            )
+
+    def update_task_rollout_stats(
+        self,
+        task_id: int,
+        function_call_count: int,
+        web_search_call_count: int,
+        token_count: int,
+        progress_report_count: int,
+    ) -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE article_tasks
+                SET function_call_count = ?,
+                    web_search_call_count = ?,
+                    token_count = ?,
+                    progress_report_count = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    max(0, int(function_call_count)),
+                    max(0, int(web_search_call_count)),
+                    max(0, int(token_count)),
+                    max(0, int(progress_report_count)),
+                    now,
+                    int(task_id),
+                ),
             )
 
     def ensure_user_task_for_article(
@@ -511,7 +580,8 @@ class ArticleRepository(SQLiteRepositoryBase):
             rows = conn.execute(
                 """
                 SELECT t.id, t.platform, t.account_id, t.article_id, t.status, t.run_dir,
-                       t.session_id, t.pid, t.last_error, t.created_at, t.updated_at,
+                       t.session_id, t.pid, t.function_call_count, t.web_search_call_count,
+                       t.token_count, t.progress_report_count, t.last_error, t.created_at, t.updated_at,
                        a.normalized_url, a.source_url
                 FROM article_tasks t
                 JOIN articles a ON a.id = t.article_id
