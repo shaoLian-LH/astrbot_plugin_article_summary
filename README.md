@@ -25,7 +25,7 @@
 ## 指令
 
 - `/获取文章列表`：查看当前用户的“处理中/停止”任务与状态。
-- `/继续获取文章 <列表项id>`：继续一个停止任务，默认执行 `codex --yolo resume {session} 继续`。
+- `/继续获取文章 <列表项id>`：继续一个停止任务，默认执行 `codex exec resume --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check {session} 继续`。
 
 ## 生命周期
 
@@ -37,8 +37,8 @@
 插件提供 `_conf_schema.json`，可在 AstrBot 面板配置：
 
 - `codex_cmd`：默认 `codex --yolo`
-- `codex_non_interactive_cmd`：默认 `codex exec --full-auto --skip-git-repo-check`
-- `codex_resume_cmd_template`：默认 `codex --yolo resume {session} 继续`
+- `codex_non_interactive_cmd`：默认 `codex exec --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check`
+- `codex_resume_cmd_template`：默认 `codex exec resume --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check {session} 继续`
 - `codex_sessions_root`：默认 `~/.codex/sessions`
 - `codex_progress_report_seconds`：默认 `120`
 - `codex_progress_poll_seconds`：默认 `5`
@@ -69,4 +69,5 @@
 - 同链接文章会永久保存在数据库，后续用户请求可直接复用。
 - 若 reply 段只包含 `id`（不含正文），插件会尝试调用 OneBot `get_msg` 反查原消息再提取链接。
 - 若 `codex_cmd` 是交互式（如 `codex --yolo`），插件会自动切换到 `codex_non_interactive_cmd` 执行，避免 `stdin is not a terminal`。
+- 默认非交互命令会启用 `--yolo` 并继承容器环境变量（`shell_environment_policy.inherit=all`），用于避免 `bun`/本地端口监听在沙箱内被拦截；如需更严格权限，请改写这两个命令配置。
 - 若 Codex 执行超过 `codex_progress_report_seconds`，插件会分段扫描 rollout jsonl 并播报进度。

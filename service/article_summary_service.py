@@ -435,10 +435,13 @@ class ArticleSummaryService(Star):
     def _build_resume_codex_args(self, session_id: str) -> tuple[list[str], str]:
         template = self._cfg_str(
             "codex_resume_cmd_template",
-            "codex --yolo resume {session} 继续",
+            "codex exec resume --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check {session} 继续",
         ).strip()
         if not template:
-            template = "codex --yolo resume {session} 继续"
+            template = (
+                "codex exec resume --yolo "
+                "-c shell_environment_policy.inherit=all --skip-git-repo-check {session} 继续"
+            )
 
         try:
             args = shlex.split(template)
@@ -1290,15 +1293,26 @@ class ArticleSummaryService(Star):
     def _build_non_interactive_codex_args(self, prompt: str) -> list[str]:
         fallback_cmd = self._cfg_str(
             "codex_non_interactive_cmd",
-            "codex exec --full-auto --skip-git-repo-check",
+            "codex exec --yolo "
+            "-c shell_environment_policy.inherit=all --skip-git-repo-check",
         ).strip()
         if not fallback_cmd:
-            fallback_cmd = "codex exec --full-auto --skip-git-repo-check"
+            fallback_cmd = (
+                "codex exec --yolo "
+                "-c shell_environment_policy.inherit=all --skip-git-repo-check"
+            )
 
         try:
             fallback_base = shlex.split(fallback_cmd)
         except Exception:
-            fallback_base = ["codex", "exec", "--full-auto", "--skip-git-repo-check"]
+            fallback_base = [
+                "codex",
+                "exec",
+                "--yolo",
+                "-c",
+                "shell_environment_policy.inherit=all",
+                "--skip-git-repo-check",
+            ]
 
         return self._inject_prompt(fallback_base, prompt)
 

@@ -8,14 +8,14 @@
   "codex_non_interactive_cmd": {
     "type": "string",
     "description": "检测到 codex 交互命令时自动切换到的非交互命令",
-    "hint": "默认 codex exec --full-auto --skip-git-repo-check",
-    "default": "codex exec --full-auto --skip-git-repo-check"
+    "hint": "默认 codex exec --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check",
+    "default": "codex exec --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check"
   },
   "codex_resume_cmd_template": {
     "type": "string",
     "description": "继续获取文章时使用的 Codex 命令模板，支持 {session}",
-    "hint": "默认 codex --yolo resume {session} 继续",
-    "default": "codex --yolo resume {session} 继续"
+    "hint": "默认 codex exec resume --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check {session} 继续",
+    "default": "codex exec resume --yolo -c shell_environment_policy.inherit=all --skip-git-repo-check {session} 继续"
   },
   "codex_sessions_root": {
     "type": "string",
