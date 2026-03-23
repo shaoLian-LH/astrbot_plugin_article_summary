@@ -3,7 +3,10 @@ from __future__ import annotations
 import time
 from typing import Iterable, Optional
 
-from infrastructure.sqlite_base import SQLiteRepositoryBase
+if __package__ and __package__.count(".") >= 1:
+    from ..infrastructure.sqlite_base import SQLiteRepositoryBase
+else:
+    from infrastructure.sqlite_base import SQLiteRepositoryBase
 
 
 ARTICLE_STATUS_PENDING = "pending"
