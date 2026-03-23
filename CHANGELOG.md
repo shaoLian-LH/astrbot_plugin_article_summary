@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.0.10 - 2026-03-23
+## Unreleased
 
 ### Fixed
 - 将单文件 `main.py` 重构为 `main + handlers + service + utils` 分层，入口仅保留注册与路由装配。
