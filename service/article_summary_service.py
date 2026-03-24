@@ -452,6 +452,8 @@ class ArticleSummaryService(Star):
             article_id=0,
             article_url=str(article.get("source_url") or article.get("normalized_url") or ""),
             prompt_preview=prompt,
+            progress_report_seconds_override=60,
+            send_progress_immediately=True,
         )
         if codex_error:
             repo.set_article_publish_failed(target_article_id, codex_error)
@@ -1706,9 +1708,15 @@ class ArticleSummaryService(Star):
         article_id: int,
         article_url: str = "",
         prompt_preview: str = "",
+        progress_report_seconds_override: Optional[int] = None,
+        send_progress_immediately: bool = False,
     ) -> tuple[str, str]:
         timeout_seconds = self._cfg_int("codex_timeout_seconds", 900)
-        report_seconds = max(0, self._cfg_int("codex_progress_report_seconds", 120))
+        report_seconds = (
+            max(0, int(progress_report_seconds_override))
+            if progress_report_seconds_override is not None
+            else max(0, self._cfg_int("codex_progress_report_seconds", 120))
+        )
         poll_seconds = max(1, self._cfg_int("codex_progress_poll_seconds", 5))
         logger.info(
             "[article-summary] codex exec cwd=%s cmd=%s prompt=%s",
@@ -1771,6 +1779,53 @@ class ArticleSummaryService(Star):
 
         timed_out = False
         try:
+            if send_progress_immediately and report_seconds > 0:
+                await self._scan_rollout_tracker(rollout_tracker)
+                tracker_session_id = str(rollout_tracker.get("session_id") or "").strip()
+                if tracker_session_id and tracker_session_id != session_id:
+                    if not self._is_rollout_tracker_bound_to_run(rollout_tracker):
+                        logger.warning(
+                            "[article-summary] skip session bind task=%s session=%s reason=rollout_not_bound_to_run",
+                            task_id,
+                            tracker_session_id,
+                        )
+                        tracker_session_id = ""
+                if tracker_session_id and tracker_session_id != session_id:
+                    session_id = tracker_session_id
+                    async with self._active_codex_lock:
+                        active = self._active_codex_tasks.get(task_id)
+                        if isinstance(active, dict):
+                            active["session_id"] = session_id
+                    repo.update_task_status(
+                        task_id,
+                        status=TASK_STATUS_PROCESSING,
+                        session_id=session_id,
+                        pid=int(getattr(process, "pid", 0) or 0),
+                    )
+                    repo.set_article_processing(article_id, run_dir=str(run_dir), session_id=session_id)
+
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=0.001)
+                except asyncio.TimeoutError:
+                    pass
+
+                if process.returncode is None:
+                    progress_tick += 1
+                    elapsed_seconds = int(loop.time() - started_at)
+                    progress_text = self._build_rollout_progress_text(
+                        rollout_tracker,
+                        elapsed_seconds,
+                        progress_tick,
+                        normalized_article_url,
+                    )
+                    await self._send_progress_message(event, progress_text)
+                else:
+                    logger.info(
+                        "[article-summary] skip immediate progress task=%s reason=process_exited rc=%s",
+                        task_id,
+                        process.returncode,
+                    )
+
             while process.returncode is None:
                 elapsed = loop.time() - started_at
                 if elapsed > timeout_seconds:

@@ -79,6 +79,7 @@
 - 若 reply 段只包含 `id`（不含正文），插件会尝试调用 OneBot `get_msg` 反查原消息再提取链接。
 - 若 `codex_cmd` 是交互式（如 `codex --yolo`），插件会自动切换到 `codex_non_interactive_cmd` 执行，避免 `stdin is not a terminal`。
 - 默认非交互命令会启用 `--yolo` 并继承容器环境变量（`shell_environment_policy.inherit=all`），用于避免 `bun`/本地端口监听在沙箱内被拦截；如需更严格权限，请改写这两个命令配置。
-- 若 Codex 执行超过 `codex_progress_report_seconds`，插件会分段扫描 rollout jsonl 并播报进度，格式为：
-  `[文章总结中] 已过 n 分钟（第m次进度播报）`，并展示工具调用数、额外搜索数、累计 token 数与原文地址。
+- 抓取/继续流程：若 Codex 执行超过 `codex_progress_report_seconds`，插件会分段扫描 rollout jsonl 并播报进度。
+- 发布流程（`/发布文章`）：启动后立即播报一次进度，并每 60 秒继续播报。
+- 进度消息格式为 `[文章总结中] 已过 n 分钟（第m次进度播报）`，并展示工具调用数、额外搜索数、累计 token 数与原文地址。
 - 进度中的 `token` 取自 rollout `event_msg.token_count.info.total_token_usage.total_tokens` 的最新值。

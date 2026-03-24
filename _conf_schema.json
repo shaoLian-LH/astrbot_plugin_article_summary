@@ -25,7 +25,7 @@
   },
   "codex_progress_report_seconds": {
     "type": "int",
-    "description": "Codex 执行超过该秒数后开始进度播报，并按该间隔持续播报",
+    "description": "抓取/继续流程中，Codex 执行超过该秒数后开始进度播报，并按该间隔持续播报（发布流程固定为立即一次+每60秒）",
     "default": 120
   },
   "codex_progress_poll_seconds": {
