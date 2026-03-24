@@ -87,6 +87,17 @@ TASK_LIST_MAX_ITEMS = 30
 TASK_LIST_COMPLETED_LIMIT = 10
 PROGRESS_TITLE_SUMMARY = "文章总结中"
 PROGRESS_TITLE_PUBLISH = "文章发布中"
+PUBLISH_PROGRESS_REPORT_SECONDS = 120
+PUBLISH_TARGET_HINT_PATTERN = re.compile(
+    r"(空间|团队|知识库|可见|匹配|未找到|link|https?://|space|team|knowledge\s*base|not\s+found|visible)",
+    re.IGNORECASE,
+)
+PUBLISH_PROMPT_NOT_FOUND_REQUIREMENT = (
+    "【必须遵守】若未找到对应的空间、团队或知识库：\n"
+    "1) 立即停止发布，不得猜测或自动改用其他目标；\n"
+    "2) 向用户说明当前可见的空间、团队、知识库列表，每一项都给出名称和 link；\n"
+    "3) 明确指出未匹配发生在哪一层（空间/团队/知识库），并给出修正建议。"
+)
 
 
 class ArticleSummaryService(Star):
@@ -442,10 +453,27 @@ class ArticleSummaryService(Star):
             yield event.plain_result("[article-summary] 未找到 article.md 缓存文件，无法发布。")
             return
 
-        cmd_space = str(args[1] or "").strip() if len(args) > 1 else ""
-        cmd_team = str(args[2] or "").strip() if len(args) > 2 else ""
-        cmd_kb = " ".join(args[3:]).strip() if len(args) > 3 else ""
         defaults = repo.get_user_publish_defaults(platform, account_id) or {}
+        cmd_space, cmd_team, cmd_kb, parse_error = self._resolve_publish_command_targets(
+            defaults=defaults,
+            target_args=args[1:],
+        )
+        if parse_error:
+            publish_cmd = self._format_command_by_context(
+                event,
+                f"发布文章 {target_article_id} <空间> <团队> <知识库名称>",
+            )
+            yield event.plain_result(
+                "[article-summary] 发布参数不符合顺序缺省规则。\n"
+                f"{parse_error}\n"
+                "规则：提供 3+ 个参数时按 空间/团队/知识库 解析；"
+                "提供 2 个参数时仅在已设置默认空间时按 团队/知识库 解析；"
+                "提供 1 个参数时仅在已设置默认空间与默认团队时按 知识库 解析。\n"
+                f"{self._format_publish_defaults(defaults)}\n"
+                f"完整写法示例：{publish_cmd}"
+            )
+            return
+
         space, team, knowledge_base, missing = self._resolve_publish_targets(
             defaults,
             cmd_space=cmd_space,
@@ -454,12 +482,20 @@ class ArticleSummaryService(Star):
         )
         if missing:
             missing_text = "、".join(missing)
+            set_space_cmd = self._format_command_by_context(event, "默认发布空间 <空间名或代号>")
+            set_team_cmd = self._format_command_by_context(event, "默认发布团队 <团队名或代号>")
+            set_kb_cmd = self._format_command_by_context(event, "默认发布知识库 <知识库名或代号>")
+            set_all_cmd = self._format_command_by_context(event, "默认发布 <空间> <团队> <知识库>")
             yield event.plain_result(
                 "[article-summary] 发布目标不完整，缺少："
                 f"{missing_text}\n"
+                "发布参数缺省需按 空间 -> 团队 -> 知识库 的顺序满足。\n"
                 f"{self._format_publish_defaults(defaults)}\n"
-                "请先设置默认值：/默认发布空间、/默认发布团队、/默认发布知识库，"
-                "或直接执行 /默认发布 <空间> <团队> <知识库>"
+                "请先设置默认值：\n"
+                f"- {set_space_cmd}\n"
+                f"- {set_team_cmd}\n"
+                f"- {set_kb_cmd}\n"
+                f"或直接执行：{set_all_cmd}"
             )
             return
 
@@ -490,13 +526,19 @@ class ArticleSummaryService(Star):
             article_id=0,
             article_url=str(article.get("source_url") or article.get("normalized_url") or ""),
             prompt_preview=prompt,
-            progress_report_seconds_override=0,
+            progress_report_seconds_override=PUBLISH_PROGRESS_REPORT_SECONDS,
             send_progress_immediately=False,
             progress_title=PROGRESS_TITLE_PUBLISH,
             include_web_search_in_progress=False,
         )
         if codex_error:
             repo.set_article_publish_failed(target_article_id, codex_error)
+            failure_diag = self._build_publish_failure_diagnostics(run_dir)
+            diag_text = f"\n{failure_diag}" if failure_diag else ""
+            yield event.plain_result(
+                f"[article-summary] 发布失败：{codex_error}\n"
+                f"{self._format_publish_defaults(defaults)}{diag_text}"
+            )
             logger.warning(
                 "[article-summary] publish failed article=%s err=%s",
                 target_article_id,
@@ -746,7 +788,7 @@ class ArticleSummaryService(Star):
             "[article-summary] 可用命令：\n"
             "1. /获取文章列表\n"
             "2. /继续获取文章 <列表项id>\n"
-            "3. /发布文章 <文章ID> [空间] [团队] [知识库名称]\n"
+            "3. /发布文章 <文章ID> [空间] [团队] [知识库名称]（缺省按空间->团队->知识库顺序生效）\n"
             "4. /默认发布空间 <空间名或代号>\n"
             "5. /默认发布团队 <团队名或代号>\n"
             "6. /默认发布知识库 <知识库名或代号>\n"
@@ -803,6 +845,42 @@ class ArticleSummaryService(Star):
             missing.append("知识库")
         return space, team, knowledge_base, missing
 
+    def _resolve_publish_command_targets(
+        self,
+        defaults: dict,
+        target_args: list[str],
+    ) -> tuple[str, str, str, str]:
+        default_space = str(defaults.get("default_space") or "").strip()
+        default_team = str(defaults.get("default_team") or "").strip()
+        arg_count = len(target_args)
+
+        if arg_count >= 3:
+            return (
+                str(target_args[0] or "").strip(),
+                str(target_args[1] or "").strip(),
+                " ".join(target_args[2:]).strip(),
+                "",
+            )
+        if arg_count == 2:
+            if not default_space:
+                return "", "", "", "当前未设置默认发布空间，无法将两个参数解析为“团队 + 知识库”。"
+            return "", str(target_args[0] or "").strip(), str(target_args[1] or "").strip(), ""
+        if arg_count == 1:
+            missing_defaults: list[str] = []
+            if not default_space:
+                missing_defaults.append("默认发布空间")
+            if not default_team:
+                missing_defaults.append("默认发布团队")
+            if missing_defaults:
+                return (
+                    "",
+                    "",
+                    "",
+                    f"当前缺少{'、'.join(missing_defaults)}，无法将单参数解析为“知识库”。",
+                )
+            return "", "", str(target_args[0] or "").strip(), ""
+        return "", "", "", ""
+
     def _format_publish_defaults(self, defaults: dict) -> str:
         space = str(defaults.get("default_space") or "").strip() or "未设置"
         team = str(defaults.get("default_team") or "").strip() or "未设置"
@@ -845,6 +923,14 @@ class ArticleSummaryService(Star):
             event,
             f"发布文章 {max(0, article_id)} <空间> <团队> <知识库>",
         )
+        publish_cmd_team_kb = self._format_command_by_context(
+            event,
+            f"发布文章 {max(0, article_id)} <团队> <知识库>",
+        )
+        publish_cmd_kb = self._format_command_by_context(
+            event,
+            f"发布文章 {max(0, article_id)} <知识库>",
+        )
         set_space_cmd = self._format_command_by_context(event, "默认发布空间 <空间名或代号>")
         set_team_cmd = self._format_command_by_context(event, "默认发布团队 <团队名或代号>")
         set_kb_cmd = self._format_command_by_context(event, "默认发布知识库 <知识库名或代号>")
@@ -852,6 +938,9 @@ class ArticleSummaryService(Star):
         return (
             "[article-summary] 文章解析成功，可使用以下命令发布：\n"
             f"{publish_cmd}\n\n"
+            "简写命令（按默认值顺序缺省）：\n"
+            f"- {publish_cmd_team_kb}（需已设置默认空间）\n"
+            f"- {publish_cmd_kb}（需已设置默认空间和默认团队）\n\n"
             f"{self._format_publish_defaults(defaults)}\n"
             "设置默认发布配置命令：\n"
             f"- {set_space_cmd}\n"
@@ -918,18 +1007,19 @@ class ArticleSummaryService(Star):
             "并且要注意优先处理图片上传和文章内图片链接替换的逻辑",
         )
         try:
-            return template.format(
+            prompt = template.format(
                 article_path=str(article_file),
                 space=space_name,
                 team=team_name,
                 knowledge_base=knowledge_base_name,
             )
         except Exception:
-            return (
+            prompt = (
                 "你现在需要使用 $post-article-to-xws-knowledgebase 的能力将 "
                 f"{article_file} 内容发布到 {space_name} 空间 {team_name} 团队下的 "
                 f"{knowledge_base_name} 知识库中，并且要注意优先处理图片上传和文章内图片链接替换的逻辑"
             )
+        return f"{prompt.rstrip()}\n\n{PUBLISH_PROMPT_NOT_FOUND_REQUIREMENT}"
 
     def _extract_first_publish_url(self, run_dir: Path) -> str:
         first_url_fallback = ""
@@ -2456,6 +2546,42 @@ class ArticleSummaryService(Star):
         if len(text) <= max_chars:
             return text.strip()
         return text[-max_chars:].strip()
+
+    def _collect_publish_target_hints(self, run_dir: Path, max_lines: int = 6) -> list[str]:
+        if max_lines <= 0:
+            return []
+
+        collected_reversed: list[str] = []
+        seen: set[str] = set()
+        for file_name in ("codex.stdout.log", "codex.stderr.log"):
+            text = self._tail_file_text(run_dir / file_name, 12000)
+            if not text:
+                continue
+
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            for line in reversed(lines):
+                normalized = MULTI_SPACE_PATTERN.sub(" ", line).strip()
+                if not normalized:
+                    continue
+                if not PUBLISH_TARGET_HINT_PATTERN.search(normalized):
+                    continue
+                clipped = self._clip_text(normalized, 320)
+                if clipped in seen:
+                    continue
+                seen.add(clipped)
+                collected_reversed.append(clipped)
+                if len(collected_reversed) >= max_lines:
+                    break
+            if len(collected_reversed) >= max_lines:
+                break
+
+        return list(reversed(collected_reversed))
+
+    def _build_publish_failure_diagnostics(self, run_dir: Path) -> str:
+        hints = self._collect_publish_target_hints(run_dir, max_lines=6)
+        if not hints:
+            return ""
+        return "发布匹配诊断（日志摘要）：\n" + "\n".join(f"- {line}" for line in hints)
 
     def _find_latest_article(self, run_dir: Path) -> Optional[Path]:
         candidates = [
