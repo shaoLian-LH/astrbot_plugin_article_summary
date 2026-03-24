@@ -14,6 +14,9 @@ ARTICLE_STATUS_PROCESSING = "processing"
 ARTICLE_STATUS_STOPPED = "stopped"
 ARTICLE_STATUS_COMPLETED = "completed"
 
+ARTICLE_PUBLISH_STATUS_PENDING = "pending"
+ARTICLE_PUBLISH_STATUS_FAILED = "failed"
+
 TASK_STATUS_PROCESSING = "processing"
 TASK_STATUS_STOPPED = "stopped"
 TASK_STATUS_COMPLETED = "completed"
@@ -34,6 +37,11 @@ class ArticleRepository(SQLiteRepositoryBase):
                 article_plain_text TEXT NOT NULL DEFAULT '',
                 summary_text TEXT NOT NULL DEFAULT '',
                 article_file_path TEXT NOT NULL DEFAULT '',
+                owner_platform TEXT NOT NULL DEFAULT '',
+                owner_account_id TEXT NOT NULL DEFAULT '',
+                publish_status TEXT NOT NULL DEFAULT 'pending',
+                publish_last_error TEXT NOT NULL DEFAULT '',
+                publish_updated_at INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
                 last_session_id TEXT NOT NULL DEFAULT '',
                 last_run_dir TEXT NOT NULL DEFAULT '',
@@ -59,12 +67,35 @@ class ArticleRepository(SQLiteRepositoryBase):
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS user_publish_defaults (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                default_space TEXT NOT NULL DEFAULT '',
+                default_team TEXT NOT NULL DEFAULT '',
+                default_knowledge_base TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             """
         )
 
     def _ensure_columns(self, conn) -> None:
         if not self._column_exists(conn, "articles", "article_file_path"):
             conn.execute("ALTER TABLE articles ADD COLUMN article_file_path TEXT NOT NULL DEFAULT ''")
+        if not self._column_exists(conn, "articles", "owner_platform"):
+            conn.execute("ALTER TABLE articles ADD COLUMN owner_platform TEXT NOT NULL DEFAULT ''")
+        if not self._column_exists(conn, "articles", "owner_account_id"):
+            conn.execute("ALTER TABLE articles ADD COLUMN owner_account_id TEXT NOT NULL DEFAULT ''")
+        if not self._column_exists(conn, "articles", "publish_status"):
+            conn.execute(
+                "ALTER TABLE articles ADD COLUMN publish_status TEXT NOT NULL DEFAULT 'pending'",
+            )
+        if not self._column_exists(conn, "articles", "publish_last_error"):
+            conn.execute("ALTER TABLE articles ADD COLUMN publish_last_error TEXT NOT NULL DEFAULT ''")
+        if not self._column_exists(conn, "articles", "publish_updated_at"):
+            conn.execute("ALTER TABLE articles ADD COLUMN publish_updated_at INTEGER NOT NULL DEFAULT 0")
         if not self._column_exists(conn, "articles", "last_session_id"):
             conn.execute("ALTER TABLE articles ADD COLUMN last_session_id TEXT NOT NULL DEFAULT ''")
         if not self._column_exists(conn, "articles", "last_run_dir"):
@@ -97,6 +128,12 @@ class ArticleRepository(SQLiteRepositoryBase):
             CREATE INDEX IF NOT EXISTS idx_articles_status_updated
             ON articles(status, updated_at DESC, id DESC);
 
+            CREATE INDEX IF NOT EXISTS idx_articles_owner
+            ON articles(owner_platform, owner_account_id, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_articles_publish_status_updated
+            ON articles(publish_status, publish_updated_at DESC, id DESC);
+
             CREATE INDEX IF NOT EXISTS idx_article_tasks_owner_status_updated
             ON article_tasks(platform, account_id, status, updated_at DESC, id DESC);
 
@@ -105,6 +142,9 @@ class ArticleRepository(SQLiteRepositoryBase):
 
             CREATE INDEX IF NOT EXISTS idx_article_tasks_owner_article_updated
             ON article_tasks(platform, account_id, article_id, updated_at DESC, id DESC);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_publish_defaults_owner
+            ON user_publish_defaults(platform, account_id);
             """
         )
 
@@ -119,8 +159,9 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 """
                 SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
-                       summary_text, article_file_path, last_error, last_session_id,
-                       last_run_dir, created_at, updated_at, completed_at
+                       summary_text, article_file_path, owner_platform, owner_account_id,
+                       publish_status, publish_last_error, publish_updated_at,
+                       last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 FROM articles
                 WHERE id = ?
                 """,
@@ -133,8 +174,9 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 """
                 SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
-                       summary_text, article_file_path, last_error, last_session_id,
-                       last_run_dir, created_at, updated_at, completed_at
+                       summary_text, article_file_path, owner_platform, owner_account_id,
+                       publish_status, publish_last_error, publish_updated_at,
+                       last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 FROM articles
                 WHERE normalized_url = ?
                 """,
@@ -142,19 +184,26 @@ class ArticleRepository(SQLiteRepositoryBase):
             ).fetchone()
         return self._to_dict(row) or None
 
-    def create_or_get_article(self, normalized_url: str, source_url: str) -> dict:
+    def create_or_get_article(
+        self,
+        normalized_url: str,
+        source_url: str,
+        owner_platform: str = "",
+        owner_account_id: str = "",
+    ) -> dict:
         now = self._now()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO articles (
                     normalized_url, source_url, status, article_markdown, article_plain_text,
-                    summary_text, article_file_path, last_error, last_session_id,
-                    last_run_dir, created_at, updated_at, completed_at
+                    summary_text, article_file_path, owner_platform, owner_account_id,
+                    publish_status, publish_last_error, publish_updated_at,
+                    last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 )
-                VALUES (?, ?, 'pending', '', '', '', '', '', '', '', ?, ?, 0)
+                VALUES (?, ?, 'pending', '', '', '', '', ?, ?, 'pending', '', ?, '', '', '', ?, ?, 0)
                 """,
-                (normalized_url, source_url, now, now),
+                (normalized_url, source_url, owner_platform, owner_account_id, now, now, now),
             )
             if source_url:
                 conn.execute(
@@ -168,8 +217,9 @@ class ArticleRepository(SQLiteRepositoryBase):
             row = conn.execute(
                 """
                 SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
-                       summary_text, article_file_path, last_error, last_session_id,
-                       last_run_dir, created_at, updated_at, completed_at
+                       summary_text, article_file_path, owner_platform, owner_account_id,
+                       publish_status, publish_last_error, publish_updated_at,
+                       last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 FROM articles
                 WHERE normalized_url = ?
                 """,
@@ -236,6 +286,9 @@ class ArticleRepository(SQLiteRepositoryBase):
                     article_plain_text = ?,
                     summary_text = ?,
                     article_file_path = ?,
+                    publish_status = ?,
+                    publish_last_error = '',
+                    publish_updated_at = ?,
                     last_run_dir = ?,
                     last_session_id = ?,
                     last_error = '',
@@ -248,12 +301,44 @@ class ArticleRepository(SQLiteRepositoryBase):
                     article_plain_text,
                     summary_text,
                     article_file_path,
+                    ARTICLE_PUBLISH_STATUS_PENDING,
+                    now,
                     run_dir,
                     session_id,
                     now,
                     now,
                     article_id,
                 ),
+            )
+
+    def set_article_publish_failed(self, article_id: int, last_error: str) -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET publish_status = ?,
+                    publish_last_error = ?,
+                    publish_updated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (ARTICLE_PUBLISH_STATUS_FAILED, last_error, now, now, article_id),
+            )
+
+    def set_article_publish_pending(self, article_id: int, last_error: str = "") -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET publish_status = ?,
+                    publish_last_error = ?,
+                    publish_updated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (ARTICLE_PUBLISH_STATUS_PENDING, last_error, now, now, article_id),
             )
 
     def get_task_by_id(self, task_id: int) -> Optional[dict]:
@@ -279,7 +364,9 @@ class ArticleRepository(SQLiteRepositoryBase):
                        t.token_count, t.progress_report_count, t.last_error, t.created_at, t.updated_at,
                        a.normalized_url, a.source_url, a.status AS article_status,
                        a.last_session_id, a.last_error AS article_last_error,
-                       a.article_markdown, a.summary_text, a.article_file_path
+                       a.article_markdown, a.summary_text, a.article_file_path,
+                       a.owner_platform, a.owner_account_id,
+                       a.publish_status, a.publish_last_error, a.publish_updated_at
                 FROM article_tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ? AND t.platform = ? AND t.account_id = ?
@@ -593,6 +680,140 @@ class ArticleRepository(SQLiteRepositoryBase):
                 (platform, account_id),
             ).fetchall()
         return [self._to_dict(row) for row in rows]
+
+    def get_user_publish_defaults(self, platform: str, account_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT platform, account_id, default_space, default_team, default_knowledge_base,
+                       created_at, updated_at
+                FROM user_publish_defaults
+                WHERE platform = ? AND account_id = ?
+                """,
+                (platform, account_id),
+            ).fetchone()
+        return self._to_dict(row) or None
+
+    def upsert_user_publish_defaults(
+        self,
+        platform: str,
+        account_id: str,
+        default_space: Optional[str] = None,
+        default_team: Optional[str] = None,
+        default_knowledge_base: Optional[str] = None,
+    ) -> dict:
+        now = self._now()
+        current = self.get_user_publish_defaults(platform, account_id) or {}
+
+        space_value = str(current.get("default_space") or "")
+        team_value = str(current.get("default_team") or "")
+        knowledge_base_value = str(current.get("default_knowledge_base") or "")
+
+        if default_space is not None:
+            space_value = str(default_space or "").strip()
+        if default_team is not None:
+            team_value = str(default_team or "").strip()
+        if default_knowledge_base is not None:
+            knowledge_base_value = str(default_knowledge_base or "").strip()
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_publish_defaults (
+                    platform, account_id, default_space, default_team,
+                    default_knowledge_base, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, account_id) DO UPDATE SET
+                    default_space = excluded.default_space,
+                    default_team = excluded.default_team,
+                    default_knowledge_base = excluded.default_knowledge_base,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    platform,
+                    account_id,
+                    space_value,
+                    team_value,
+                    knowledge_base_value,
+                    int(current.get("created_at") or now),
+                    now,
+                ),
+            )
+
+        refreshed = self.get_user_publish_defaults(platform, account_id)
+        if refreshed is None:
+            raise RuntimeError("读取发布默认配置失败")
+        return refreshed
+
+    def resolve_article_owner(self, article_id: int) -> Optional[dict]:
+        article = self.get_article_by_id(article_id)
+        if article is None:
+            return None
+
+        owner_platform = str(article.get("owner_platform") or "").strip()
+        owner_account_id = str(article.get("owner_account_id") or "").strip()
+        if owner_platform and owner_account_id:
+            return {
+                "platform": owner_platform,
+                "account_id": owner_account_id,
+                "source": "article",
+            }
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT platform, account_id
+                FROM article_tasks
+                WHERE article_id = ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (article_id,),
+            ).fetchone()
+        task_owner = self._to_dict(row)
+        if not task_owner:
+            return None
+
+        fallback_platform = str(task_owner.get("platform") or "").strip()
+        fallback_account_id = str(task_owner.get("account_id") or "").strip()
+        if not fallback_platform or not fallback_account_id:
+            return None
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET owner_platform = CASE WHEN owner_platform = '' THEN ? ELSE owner_platform END,
+                    owner_account_id = CASE WHEN owner_account_id = '' THEN ? ELSE owner_account_id END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (fallback_platform, fallback_account_id, self._now(), article_id),
+            )
+
+        return {
+            "platform": fallback_platform,
+            "account_id": fallback_account_id,
+            "source": "task",
+        }
+
+    def delete_article_with_tasks(self, article_id: int) -> dict:
+        with self._connect() as conn:
+            task_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM article_tasks WHERE article_id = ?",
+                (article_id,),
+            ).fetchone()
+            task_deleted = int(task_row["cnt"] or 0) if task_row is not None else 0
+
+            conn.execute("DELETE FROM article_tasks WHERE article_id = ?", (article_id,))
+            cursor = conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
+            article_deleted = int(cursor.rowcount or 0)
+
+        return {
+            "article_deleted": article_deleted,
+            "task_deleted": task_deleted,
+        }
 
     def stop_all_processing(self, last_error: str) -> int:
         now = self._now()

@@ -34,3 +34,95 @@ async def handle_group_message(
 ):
     async for item in ArticleSummaryService.on_group_message(plugin, event):
         yield item
+
+
+async def handle_article_summary_help_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+):
+    async for item in ArticleSummaryService.article_summary_help_command(plugin, event):
+        yield item
+
+
+async def handle_set_default_publish_space_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+    space_name: str = "",
+):
+    async for item in ArticleSummaryService.set_default_publish_space_command(
+        plugin,
+        event,
+        space_name,
+    ):
+        yield item
+
+
+async def handle_set_default_publish_team_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+    team_name: str = "",
+):
+    async for item in ArticleSummaryService.set_default_publish_team_command(
+        plugin,
+        event,
+        team_name,
+    ):
+        yield item
+
+
+async def handle_set_default_publish_kb_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+    kb_name: str = "",
+):
+    async for item in ArticleSummaryService.set_default_publish_kb_command(
+        plugin,
+        event,
+        kb_name,
+    ):
+        yield item
+
+
+async def handle_set_default_publish_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+    space_name: str = "",
+    team_name: str = "",
+    kb_name: str = "",
+):
+    async for item in ArticleSummaryService.set_default_publish_command(
+        plugin,
+        event,
+        space_name,
+        team_name,
+        kb_name,
+    ):
+        yield item
+
+
+async def handle_publish_article_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+    article_id: str = "",
+    space_name: str = "",
+    team_name: str = "",
+    kb_name: str = "",
+):
+    async for item in ArticleSummaryService.publish_article_command(
+        plugin,
+        event,
+        article_id,
+        space_name,
+        team_name,
+        kb_name,
+    ):
+        yield item
+
+
+async def handle_delete_article_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+    article_id: str = "",
+):
+    async for item in ArticleSummaryService.delete_article_command(plugin, event, article_id):
+        yield item

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 from typing import Any, Iterable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -85,6 +86,7 @@ class ArticleSummaryService(Star):
         self.article_repo: Optional[ArticleRepository] = None
         self._active_codex_tasks: dict[int, dict[str, Any]] = {}
         self._active_codex_lock = asyncio.Lock()
+        self._ephemeral_codex_task_id = 0
 
     async def initialize(self):
         repo = self._ensure_repository()
@@ -210,6 +212,315 @@ class ArticleSummaryService(Star):
             prompt_preview=f"resume {session_id}",
         ):
             yield item
+
+    async def article_summary_help_command(self, event: AstrMessageEvent):
+        event.stop_event()
+        yield event.plain_result(self._build_help_text())
+
+    async def set_default_publish_space_command(self, event: AstrMessageEvent, space_name: str = ""):
+        event.stop_event()
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        args = self._get_command_args(event, ("默认发布空间",), [space_name])
+        repo = self._ensure_repository()
+        if not args:
+            current = repo.get_user_publish_defaults(platform, account_id) or {}
+            value = str(current.get("default_space") or "").strip() or "未设置"
+            yield event.plain_result(
+                f"[article-summary] 当前默认发布空间：{value}\n"
+                "设置方式：/默认发布空间 <空间名或代号>"
+            )
+            return
+
+        target = " ".join(args).strip()
+        if not target:
+            yield event.plain_result("[article-summary] 用法：/默认发布空间 <空间名或代号>")
+            return
+
+        saved = repo.upsert_user_publish_defaults(
+            platform=platform,
+            account_id=account_id,
+            default_space=target,
+        )
+        yield event.plain_result(
+            f"[article-summary] 默认发布空间已设置为：{saved.get('default_space') or '-'}\n"
+            f"{self._format_publish_defaults(saved)}"
+        )
+
+    async def set_default_publish_team_command(self, event: AstrMessageEvent, team_name: str = ""):
+        event.stop_event()
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        args = self._get_command_args(event, ("默认发布团队",), [team_name])
+        repo = self._ensure_repository()
+        if not args:
+            current = repo.get_user_publish_defaults(platform, account_id) or {}
+            value = str(current.get("default_team") or "").strip() or "未设置"
+            yield event.plain_result(
+                f"[article-summary] 当前默认发布团队：{value}\n"
+                "设置方式：/默认发布团队 <团队名或代号>"
+            )
+            return
+
+        target = " ".join(args).strip()
+        if not target:
+            yield event.plain_result("[article-summary] 用法：/默认发布团队 <团队名或代号>")
+            return
+
+        saved = repo.upsert_user_publish_defaults(
+            platform=platform,
+            account_id=account_id,
+            default_team=target,
+        )
+        yield event.plain_result(
+            f"[article-summary] 默认发布团队已设置为：{saved.get('default_team') or '-'}\n"
+            f"{self._format_publish_defaults(saved)}"
+        )
+
+    async def set_default_publish_kb_command(self, event: AstrMessageEvent, kb_name: str = ""):
+        event.stop_event()
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        args = self._get_command_args(event, ("默认发布知识库",), [kb_name])
+        repo = self._ensure_repository()
+        if not args:
+            current = repo.get_user_publish_defaults(platform, account_id) or {}
+            value = str(current.get("default_knowledge_base") or "").strip() or "未设置"
+            yield event.plain_result(
+                f"[article-summary] 当前默认发布知识库：{value}\n"
+                "设置方式：/默认发布知识库 <知识库名或代号>"
+            )
+            return
+
+        target = " ".join(args).strip()
+        if not target:
+            yield event.plain_result("[article-summary] 用法：/默认发布知识库 <知识库名或代号>")
+            return
+
+        saved = repo.upsert_user_publish_defaults(
+            platform=platform,
+            account_id=account_id,
+            default_knowledge_base=target,
+        )
+        yield event.plain_result(
+            f"[article-summary] 默认发布知识库已设置为：{saved.get('default_knowledge_base') or '-'}\n"
+            f"{self._format_publish_defaults(saved)}"
+        )
+
+    async def set_default_publish_command(
+        self,
+        event: AstrMessageEvent,
+        space_name: str = "",
+        team_name: str = "",
+        kb_name: str = "",
+    ):
+        event.stop_event()
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        args = self._get_command_args(event, ("默认发布",), [space_name, team_name, kb_name])
+        if len(args) < 3:
+            repo = self._ensure_repository()
+            current = repo.get_user_publish_defaults(platform, account_id) or {}
+            yield event.plain_result(
+                "[article-summary] 用法：/默认发布 <空间> <团队> <知识库>\n"
+                f"{self._format_publish_defaults(current)}"
+            )
+            return
+
+        space = str(args[0] or "").strip()
+        team = str(args[1] or "").strip()
+        knowledge_base = " ".join(args[2:]).strip()
+        if not space or not team or not knowledge_base:
+            yield event.plain_result("[article-summary] 用法：/默认发布 <空间> <团队> <知识库>")
+            return
+
+        repo = self._ensure_repository()
+        saved = repo.upsert_user_publish_defaults(
+            platform=platform,
+            account_id=account_id,
+            default_space=space,
+            default_team=team,
+            default_knowledge_base=knowledge_base,
+        )
+        yield event.plain_result(
+            "[article-summary] 默认发布配置已更新。\n"
+            f"{self._format_publish_defaults(saved)}"
+        )
+
+    async def publish_article_command(
+        self,
+        event: AstrMessageEvent,
+        article_id: str = "",
+        space_name: str = "",
+        team_name: str = "",
+        kb_name: str = "",
+    ):
+        event.stop_event()
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        args = self._get_command_args(event, ("发布文章",), [article_id, space_name, team_name, kb_name])
+        if not args:
+            yield event.plain_result("[article-summary] 用法：/发布文章 <文章ID> [空间] [团队] [知识库名称]")
+            return
+
+        target_article_id = self._parse_int(args[0])
+        if target_article_id <= 0:
+            yield event.plain_result("[article-summary] 文章ID无效。用法：/发布文章 <文章ID> [空间] [团队] [知识库名称]")
+            return
+
+        repo = self._ensure_repository()
+        article = repo.get_article_by_id(target_article_id)
+        if article is None:
+            yield event.plain_result(f"[article-summary] 未找到文章 {target_article_id}。")
+            return
+
+        article_status = str(article.get("status") or "").strip()
+        has_content = bool(str(article.get("article_markdown") or "").strip()) or bool(
+            str(article.get("article_file_path") or "").strip()
+        )
+        if article_status != ARTICLE_STATUS_COMPLETED or not has_content:
+            yield event.plain_result(
+                f"[article-summary] 文章 {target_article_id} 尚未解析完成，暂不可发布。"
+            )
+            return
+
+        article_file = self._ensure_cached_article_file(article)
+        if article_file is None or not article_file.is_file():
+            yield event.plain_result("[article-summary] 未找到 article.md 缓存文件，无法发布。")
+            return
+
+        cmd_space = str(args[1] or "").strip() if len(args) > 1 else ""
+        cmd_team = str(args[2] or "").strip() if len(args) > 2 else ""
+        cmd_kb = " ".join(args[3:]).strip() if len(args) > 3 else ""
+        defaults = repo.get_user_publish_defaults(platform, account_id) or {}
+        space, team, knowledge_base, missing = self._resolve_publish_targets(
+            defaults,
+            cmd_space=cmd_space,
+            cmd_team=cmd_team,
+            cmd_knowledge_base=cmd_kb,
+        )
+        if missing:
+            missing_text = "、".join(missing)
+            yield event.plain_result(
+                "[article-summary] 发布目标不完整，缺少："
+                f"{missing_text}\n"
+                f"{self._format_publish_defaults(defaults)}\n"
+                "请先设置默认值：/默认发布空间、/默认发布团队、/默认发布知识库，"
+                "或直接执行 /默认发布 <空间> <团队> <知识库>"
+            )
+            return
+
+        run_dir = self._create_publish_run_dir(event, target_article_id)
+        self._prepare_codex_workspace_config(run_dir)
+
+        prompt = self._build_publish_prompt(
+            article_file=article_file,
+            space_name=space,
+            team_name=team,
+            knowledge_base_name=knowledge_base,
+        )
+        codex_args, codex_args_error = self._build_codex_args(prompt)
+        if codex_args_error:
+            repo.set_article_publish_failed(target_article_id, codex_args_error)
+            yield event.plain_result(f"[article-summary] 发布失败：{codex_args_error}")
+            return
+
+        temp_task_id = self._next_ephemeral_codex_task_id()
+        yield event.plain_result(
+            f"[article-summary] 正在发布文章 {target_article_id} 到空间[{space}] / 团队[{team}] / 知识库[{knowledge_base}] ..."
+        )
+        codex_error, _ = await self._run_codex(
+            event=event,
+            run_dir=run_dir,
+            resolved_args=codex_args,
+            task_id=temp_task_id,
+            article_id=0,
+            article_url=str(article.get("source_url") or article.get("normalized_url") or ""),
+            prompt_preview=prompt,
+        )
+        if codex_error:
+            repo.set_article_publish_failed(target_article_id, codex_error)
+            yield event.plain_result(f"[article-summary] 发布失败：{codex_error}")
+            return
+
+        repo.set_article_publish_pending(target_article_id, last_error="")
+        share_url = self._extract_first_publish_url(run_dir)
+        if share_url:
+            yield event.plain_result(
+                f"[article-summary] 发布完成，状态仍为待发布（支持重复发布）。\n分享链接：{share_url}"
+            )
+            return
+        yield event.plain_result("[article-summary] 发布完成，状态仍为待发布（支持重复发布）。")
+
+    async def delete_article_command(self, event: AstrMessageEvent, article_id: str = ""):
+        event.stop_event()
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            yield event.plain_result("[article-summary] 无法识别当前用户。")
+            return
+
+        args = self._get_command_args(event, ("删除文章",), [article_id])
+        target_article_id = self._parse_int(args[0] if args else article_id)
+        if target_article_id <= 0:
+            yield event.plain_result("[article-summary] 用法：/删除文章 <文章ID>")
+            return
+
+        repo = self._ensure_repository()
+        article = repo.get_article_by_id(target_article_id)
+        if article is None:
+            yield event.plain_result(f"[article-summary] 未找到文章 {target_article_id}。")
+            return
+
+        owner = repo.resolve_article_owner(target_article_id)
+        if owner is None:
+            yield event.plain_result("[article-summary] 该文章缺少创建者信息，无法执行删除。")
+            return
+
+        owner_platform = str(owner.get("platform") or "").strip()
+        owner_account = str(owner.get("account_id") or "").strip()
+        if owner_platform != platform or owner_account != account_id:
+            yield event.plain_result("[article-summary] 仅文章创建者可删除该文章缓存。")
+            return
+
+        try:
+            delete_result = repo.delete_article_with_tasks(target_article_id)
+        except Exception as exc:
+            logger.warning("[article-summary] delete article db failed article=%s err=%s", target_article_id, exc)
+            yield event.plain_result(f"[article-summary] 删除失败：数据库删除异常（{exc}）。")
+            return
+
+        if int(delete_result.get("article_deleted") or 0) <= 0:
+            yield event.plain_result("[article-summary] 删除失败，数据库记录未变更。")
+            return
+
+        deleted_files, failed_files = self._remove_article_cache(article)
+        if failed_files > 0:
+            yield event.plain_result(
+                f"[article-summary] 文章 {target_article_id} 的数据库记录已删除，"
+                f"但缓存清理部分失败（成功 {deleted_files} 项，失败 {failed_files} 项）。"
+            )
+            return
+
+        yield event.plain_result(
+            f"[article-summary] 已删除文章 {target_article_id}。"
+            f"任务记录删除 {int(delete_result.get('task_deleted') or 0)} 条，"
+            f"缓存清理成功 {deleted_files} 项。"
+        )
 
     async def on_group_message(self, event: AstrMessageEvent):
         message_id = str(getattr(event.message_obj, "message_id", "") or "")
@@ -374,6 +685,79 @@ class ArticleSummaryService(Star):
         except Exception:
             return "-"
 
+    def _build_help_text(self) -> str:
+        return (
+            "[article-summary] 可用命令：\n"
+            "1. /获取文章列表\n"
+            "2. /继续获取文章 <列表项id>\n"
+            "3. /发布文章 <文章ID> [空间] [团队] [知识库名称]\n"
+            "4. /默认发布空间 <空间名或代号>\n"
+            "5. /默认发布团队 <团队名或代号>\n"
+            "6. /默认发布知识库 <知识库名或代号>\n"
+            "7. /默认发布 <空间> <团队> <知识库>\n"
+            "8. /删除文章 <文章ID>\n"
+            "9. /文档总结帮助"
+        )
+
+    def _get_command_args(
+        self,
+        event: AstrMessageEvent,
+        command_names: tuple[str, ...],
+        fallback_args: Optional[list[str]] = None,
+    ) -> list[str]:
+        message = str(getattr(event, "message_str", "") or "").strip()
+        if message:
+            for command_name in command_names:
+                for prefix in (f"/{command_name}", command_name):
+                    if message.startswith(prefix):
+                        tail = message[len(prefix) :].strip()
+                        if not tail:
+                            return []
+                        try:
+                            return [arg for arg in shlex.split(tail) if str(arg).strip()]
+                        except Exception:
+                            return [arg for arg in tail.split() if str(arg).strip()]
+
+        result: list[str] = []
+        for arg in fallback_args or []:
+            text = str(arg or "").strip()
+            if text:
+                result.append(text)
+        return result
+
+    def _resolve_publish_targets(
+        self,
+        defaults: dict,
+        cmd_space: str = "",
+        cmd_team: str = "",
+        cmd_knowledge_base: str = "",
+    ) -> tuple[str, str, str, list[str]]:
+        space = str(cmd_space or "").strip() or str(defaults.get("default_space") or "").strip()
+        team = str(cmd_team or "").strip() or str(defaults.get("default_team") or "").strip()
+        knowledge_base = str(cmd_knowledge_base or "").strip() or str(
+            defaults.get("default_knowledge_base") or ""
+        ).strip()
+
+        missing: list[str] = []
+        if not space:
+            missing.append("空间")
+        if not team:
+            missing.append("团队")
+        if not knowledge_base:
+            missing.append("知识库")
+        return space, team, knowledge_base, missing
+
+    def _format_publish_defaults(self, defaults: dict) -> str:
+        space = str(defaults.get("default_space") or "").strip() or "未设置"
+        team = str(defaults.get("default_team") or "").strip() or "未设置"
+        knowledge_base = str(defaults.get("default_knowledge_base") or "").strip() or "未设置"
+        return (
+            "当前默认发布配置：\n"
+            f"- 空间：{space}\n"
+            f"- 团队：{team}\n"
+            f"- 知识库：{knowledge_base}"
+        )
+
     def _resolve_run_dir(self, run_dir: str) -> Optional[Path]:
         text = str(run_dir or "").strip()
         if not text:
@@ -394,6 +778,204 @@ class ArticleSummaryService(Star):
         run_dir = work_root / f"{timestamp}-t{max(0, task_id)}-{message_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
+
+    def _create_publish_run_dir(self, event: AstrMessageEvent, article_id: int) -> Path:
+        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
+        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
+        if not work_root.is_absolute():
+            work_root = Path.cwd() / work_root
+
+        message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = work_root / f"{timestamp}-publish-a{max(0, article_id)}-{message_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    def _next_ephemeral_codex_task_id(self) -> int:
+        self._ephemeral_codex_task_id -= 1
+        return self._ephemeral_codex_task_id
+
+    def _build_publish_prompt(
+        self,
+        article_file: Path,
+        space_name: str,
+        team_name: str,
+        knowledge_base_name: str,
+    ) -> str:
+        template = self._cfg_str(
+            "codex_publish_prompt_template",
+            "你现在需要使用 $post-article-to-xws-knowledgebase 的能力将 {article_path} 内容发布到 "
+            "{space} 空间 {team} 团队下的 {knowledge_base} 知识库中，"
+            "并且要注意优先处理图片上传和文章内图片链接替换的逻辑",
+        )
+        try:
+            return template.format(
+                article_path=str(article_file),
+                space=space_name,
+                team=team_name,
+                knowledge_base=knowledge_base_name,
+            )
+        except Exception:
+            return (
+                "你现在需要使用 $post-article-to-xws-knowledgebase 的能力将 "
+                f"{article_file} 内容发布到 {space_name} 空间 {team_name} 团队下的 "
+                f"{knowledge_base_name} 知识库中，并且要注意优先处理图片上传和文章内图片链接替换的逻辑"
+            )
+
+    def _extract_first_publish_url(self, run_dir: Path) -> str:
+        first_url_fallback = ""
+        for file_name in ("codex.stdout.log", "codex.stderr.log"):
+            path = run_dir / file_name
+            text = self._tail_file_text(path, 4000)
+            if not text:
+                continue
+            direct = self._extract_publish_url_from_text(text)
+            if direct:
+                return direct
+
+            urls = [self._sanitize_url_candidate(str(match.group(0) or "")) for match in URL_PATTERN.finditer(text)]
+            urls = [item for item in urls if item]
+            if not urls:
+                continue
+
+            if not first_url_fallback:
+                first_url_fallback = urls[0]
+
+            for item in urls:
+                if self._is_publish_url_candidate(item):
+                    return item
+        return first_url_fallback
+
+    def _extract_publish_url_from_text(self, text: str) -> str:
+        structured = self._extract_publish_url_from_structured_text(text)
+        if structured:
+            return structured
+
+        patterns = [
+            re.compile(r'"share_url"\s*:\s*"(?P<url>https?://[^"]+)"', re.IGNORECASE),
+            re.compile(r'"shareUrl"\s*:\s*"(?P<url>https?://[^"]+)"', re.IGNORECASE),
+            re.compile(r"'share_url'\s*:\s*'(?P<url>https?://[^']+)'", re.IGNORECASE),
+            re.compile(r"share_url\s*[:=]\s*(?P<url>https?://\S+)", re.IGNORECASE),
+            re.compile(r"分享链接\s*[:：]\s*(?P<url>https?://\S+)", re.IGNORECASE),
+        ]
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            candidate = self._sanitize_url_candidate(str(match.group("url") or ""))
+            if candidate:
+                return candidate
+        return ""
+
+    def _extract_publish_url_from_structured_text(self, text: str) -> str:
+        for raw_line in reversed(text.splitlines()):
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            if not (line.startswith("{") or line.startswith("[")):
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+
+            candidates = self._collect_publish_url_candidates(payload)
+            for item in candidates:
+                normalized = self._sanitize_url_candidate(item)
+                if normalized:
+                    return normalized
+        return ""
+
+    def _collect_publish_url_candidates(self, payload: Any) -> list[str]:
+        candidates: list[str] = []
+
+        def add_candidate(value: Any) -> None:
+            text = str(value or "").strip()
+            if text:
+                candidates.append(text)
+
+        if isinstance(payload, dict):
+            result = payload.get("result")
+            if isinstance(result, dict):
+                add_candidate(result.get("share_url"))
+                add_candidate(result.get("shareUrl"))
+
+                document = result.get("document")
+                if isinstance(document, dict):
+                    add_candidate(document.get("share_url"))
+                    add_candidate(document.get("shareUrl"))
+
+            add_candidate(payload.get("share_url"))
+            add_candidate(payload.get("shareUrl"))
+
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    add_candidate(item.get("share_url"))
+                    add_candidate(item.get("shareUrl"))
+                    result = item.get("result")
+                    if isinstance(result, dict):
+                        add_candidate(result.get("share_url"))
+                        add_candidate(result.get("shareUrl"))
+        return candidates
+
+    def _is_publish_url_candidate(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        target = f"{parsed.netloc}{parsed.path}".lower()
+        keywords = (
+            "share",
+            "knowledge",
+            "document",
+            "doc",
+            "wiki",
+        )
+        return any(keyword in target for keyword in keywords)
+
+    def _sanitize_url_candidate(self, raw: str) -> str:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        text = text.rstrip(".,;:!?)\"]}'")
+        match = URL_PATTERN.search(text)
+        if not match:
+            return ""
+        return str(match.group(0) or "").strip()
+
+    def _remove_article_cache(self, article: dict) -> tuple[int, int]:
+        removed = 0
+        failed = 0
+
+        article_id = int(article.get("id") or 0)
+        cache_root_dir = self._resolve_article_cache_root() / f"article-{article_id}"
+
+        candidates: list[Path] = [cache_root_dir]
+        file_path = str(article.get("article_file_path") or "").strip()
+        if file_path:
+            path = Path(file_path).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            candidates.append(path)
+
+        visited: set[str] = set()
+        for path in candidates:
+            normalized = str(path.resolve(strict=False))
+            if normalized in visited:
+                continue
+            visited.add(normalized)
+            if not path.exists():
+                continue
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                removed += 1
+            except Exception as exc:
+                logger.warning("[article-summary] remove cache failed path=%s err=%s", path, exc)
+                failed += 1
+        return removed, failed
 
     def _normalize_url(self, href: str) -> str:
         text = str(href or "").strip()
@@ -474,7 +1056,12 @@ class ArticleSummaryService(Star):
             yield event.plain_result("[article-summary] 链接解析失败。")
             return
 
-        article = repo.create_or_get_article(normalized_url, href)
+        article = repo.create_or_get_article(
+            normalized_url=normalized_url,
+            source_url=href,
+            owner_platform=platform,
+            owner_account_id=account_id,
+        )
         article_id = int(article.get("id") or 0)
         if article_id <= 0:
             yield event.plain_result("[article-summary] 文章记录创建失败。")
