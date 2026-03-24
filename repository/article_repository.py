@@ -16,6 +16,7 @@ ARTICLE_STATUS_COMPLETED = "completed"
 
 ARTICLE_PUBLISH_STATUS_PENDING = "pending"
 ARTICLE_PUBLISH_STATUS_FAILED = "failed"
+ARTICLE_PUBLISH_STATUS_PUBLISHED = "published"
 
 TASK_STATUS_PROCESSING = "processing"
 TASK_STATUS_STOPPED = "stopped"
@@ -341,6 +342,21 @@ class ArticleRepository(SQLiteRepositoryBase):
                 (ARTICLE_PUBLISH_STATUS_PENDING, last_error, now, now, article_id),
             )
 
+    def set_article_publish_published(self, article_id: int, last_error: str = "") -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET publish_status = ?,
+                    publish_last_error = ?,
+                    publish_updated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (ARTICLE_PUBLISH_STATUS_PUBLISHED, last_error, now, now, article_id),
+            )
+
     def get_task_by_id(self, task_id: int) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
@@ -662,24 +678,45 @@ class ArticleRepository(SQLiteRepositoryBase):
                 (session_id, session_id, last_error, now, article_id),
             )
 
-    def list_user_pending_tasks(self, platform: str, account_id: str) -> list[dict]:
+    def list_user_tasks(
+        self,
+        platform: str,
+        account_id: str,
+        statuses: Iterable[str] = (
+            TASK_STATUS_PROCESSING,
+            TASK_STATUS_STOPPED,
+            TASK_STATUS_COMPLETED,
+        ),
+    ) -> list[dict]:
+        status_list = [str(status).strip() for status in statuses if str(status).strip()]
+        if not status_list:
+            return []
+        placeholders = ",".join("?" for _ in status_list)
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT t.id, t.platform, t.account_id, t.article_id, t.status, t.run_dir,
                        t.session_id, t.pid, t.function_call_count, t.web_search_call_count,
                        t.token_count, t.progress_report_count, t.last_error, t.created_at, t.updated_at,
-                       a.normalized_url, a.source_url
+                       a.normalized_url, a.source_url, a.publish_status, a.publish_last_error,
+                       a.publish_updated_at, a.status AS article_status
                 FROM article_tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.platform = ?
                   AND t.account_id = ?
-                  AND t.status IN ('processing', 'stopped')
+                  AND t.status IN ({placeholders})
                 ORDER BY t.updated_at DESC, t.id DESC
                 """,
-                (platform, account_id),
+                [platform, account_id, *status_list],
             ).fetchall()
         return [self._to_dict(row) for row in rows]
+
+    def list_user_pending_tasks(self, platform: str, account_id: str) -> list[dict]:
+        return self.list_user_tasks(
+            platform=platform,
+            account_id=account_id,
+            statuses=(TASK_STATUS_PROCESSING, TASK_STATUS_STOPPED),
+        )
 
     def get_user_publish_defaults(self, platform: str, account_id: str) -> Optional[dict]:
         with self._connect() as conn:

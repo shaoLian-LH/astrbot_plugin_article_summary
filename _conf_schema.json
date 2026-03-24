@@ -25,7 +25,7 @@
   },
   "codex_progress_report_seconds": {
     "type": "int",
-    "description": "抓取/继续流程中，Codex 执行超过该秒数后开始进度播报，并按该间隔持续播报（发布流程固定为立即一次+每60秒）",
+    "description": "抓取/继续流程中，Codex 执行超过该秒数后开始进度播报，并按该间隔持续播报",
     "default": 120
   },
   "codex_progress_poll_seconds": {
@@ -67,6 +67,11 @@
     "type": "string",
     "description": "OneBot set_msg_emoji_like 使用的 emoji_id，留空则不打标签",
     "default": "128077"
+  },
+  "prefix": {
+    "type": "string",
+    "description": "群聊发布提示命令前缀（用于生成 /{prefix} 发布文章 ...）",
+    "default": "slfk"
   },
   "work_root": {
     "type": "string",

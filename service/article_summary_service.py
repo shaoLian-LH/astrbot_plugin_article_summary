@@ -17,6 +17,9 @@ from astrbot.api.star import Context, Star
 if __package__ and __package__.count(".") >= 1:
     from ..infrastructure.sqlite_base import DEFAULT_ARTICLE_CACHE_ROOT, DEFAULT_DB_PATH
     from ..repository.article_repository import (
+        ARTICLE_PUBLISH_STATUS_FAILED,
+        ARTICLE_PUBLISH_STATUS_PENDING,
+        ARTICLE_PUBLISH_STATUS_PUBLISHED,
         ARTICLE_STATUS_COMPLETED,
         TASK_STATUS_COMPLETED,
         TASK_STATUS_PROCESSING,
@@ -27,6 +30,9 @@ if __package__ and __package__.count(".") >= 1:
 else:
     from infrastructure.sqlite_base import DEFAULT_ARTICLE_CACHE_ROOT, DEFAULT_DB_PATH
     from repository.article_repository import (
+        ARTICLE_PUBLISH_STATUS_FAILED,
+        ARTICLE_PUBLISH_STATUS_PENDING,
+        ARTICLE_PUBLISH_STATUS_PUBLISHED,
         ARTICLE_STATUS_COMPLETED,
         TASK_STATUS_COMPLETED,
         TASK_STATUS_PROCESSING,
@@ -77,6 +83,10 @@ CODEX_SUBCOMMANDS = {
     "help",
 }
 LOG_PREVIEW_LIMIT = 240
+TASK_LIST_MAX_ITEMS = 30
+TASK_LIST_COMPLETED_LIMIT = 10
+PROGRESS_TITLE_SUMMARY = "文章总结中"
+PROGRESS_TITLE_PUBLISH = "文章发布中"
 
 
 class ArticleSummaryService(Star):
@@ -116,19 +126,47 @@ class ArticleSummaryService(Star):
             yield event.plain_result("[article-summary] 无法识别当前用户。")
             return
 
-        tasks = self._ensure_repository().list_user_pending_tasks(platform, account_id)
+        tasks = self._ensure_repository().list_user_tasks(platform, account_id)
         if not tasks:
-            yield event.plain_result("[article-summary] 当前没有正在获取/已停止的文章。")
+            yield event.plain_result("[article-summary] 当前没有可查看的文章任务。")
             return
 
-        lines = ["[article-summary] 获取文章列表："]
-        for task in tasks[:30]:
+        visible_tasks: list[dict] = []
+        completed_count = 0
+        for task in tasks:
+            status = str(task.get("status") or "").strip()
+            publish_status = str(task.get("publish_status") or "").strip()
+            if status == TASK_STATUS_COMPLETED:
+                if publish_status == ARTICLE_PUBLISH_STATUS_PUBLISHED:
+                    continue
+                if completed_count >= TASK_LIST_COMPLETED_LIMIT:
+                    continue
+                completed_count += 1
+
+            visible_tasks.append(task)
+            if len(visible_tasks) >= TASK_LIST_MAX_ITEMS:
+                break
+
+        if not visible_tasks:
+            yield event.plain_result("[article-summary] 当前没有正在获取/已停止/待发布的完成文章。")
+            return
+
+        lines = [f"[article-summary] 获取文章列表（完成项最多展示 {TASK_LIST_COMPLETED_LIMIT} 条）："]
+        for task in visible_tasks:
             task_id = int(task.get("id") or 0)
             status = str(task.get("status") or "")
             status_label = self._task_status_label(status)
+            publish_status = str(task.get("publish_status") or "").strip()
             url = str(task.get("source_url") or task.get("normalized_url") or "").strip()
             updated_at = self._format_ts(int(task.get("updated_at") or 0))
-            line = f"{task_id}. [{status_label}] {self._preview_text(url)}（更新时间: {updated_at}）"
+            if status == TASK_STATUS_COMPLETED:
+                publish_label = self._publish_status_label(publish_status)
+                line = (
+                    f"{task_id}. [{status_label}/{publish_label}] "
+                    f"{self._preview_text(url)}（更新时间: {updated_at}）"
+                )
+            else:
+                line = f"{task_id}. [{status_label}] {self._preview_text(url)}（更新时间: {updated_at}）"
             if status == TASK_STATUS_STOPPED:
                 line += f" 可继续：/继续获取文章 {task_id}"
             lines.append(line)
@@ -452,22 +490,30 @@ class ArticleSummaryService(Star):
             article_id=0,
             article_url=str(article.get("source_url") or article.get("normalized_url") or ""),
             prompt_preview=prompt,
-            progress_report_seconds_override=60,
-            send_progress_immediately=True,
+            progress_report_seconds_override=0,
+            send_progress_immediately=False,
+            progress_title=PROGRESS_TITLE_PUBLISH,
+            include_web_search_in_progress=False,
         )
         if codex_error:
             repo.set_article_publish_failed(target_article_id, codex_error)
-            yield event.plain_result(f"[article-summary] 发布失败：{codex_error}")
-            return
-
-        repo.set_article_publish_pending(target_article_id, last_error="")
-        share_url = self._extract_first_publish_url(run_dir)
-        if share_url:
-            yield event.plain_result(
-                f"[article-summary] 发布完成，状态仍为待发布（支持重复发布）。\n分享链接：{share_url}"
+            logger.warning(
+                "[article-summary] publish failed article=%s err=%s",
+                target_article_id,
+                codex_error,
             )
             return
-        yield event.plain_result("[article-summary] 发布完成，状态仍为待发布（支持重复发布）。")
+
+        repo.set_article_publish_published(target_article_id, last_error="")
+        share_url = self._extract_first_publish_url(run_dir)
+        if share_url:
+            logger.info(
+                "[article-summary] publish done article=%s share_url=%s",
+                target_article_id,
+                share_url,
+            )
+            return
+        logger.info("[article-summary] publish done article=%s", target_article_id)
 
     async def delete_article_command(self, event: AstrMessageEvent, article_id: str = ""):
         event.stop_event()
@@ -679,6 +725,14 @@ class ArticleSummaryService(Star):
         }
         return mapping.get(status, status or "-")
 
+    def _publish_status_label(self, status: str) -> str:
+        mapping = {
+            ARTICLE_PUBLISH_STATUS_PENDING: "待发布",
+            ARTICLE_PUBLISH_STATUS_FAILED: "发布失败",
+            ARTICLE_PUBLISH_STATUS_PUBLISHED: "已发布",
+        }
+        return mapping.get(status, status or "-")
+
     def _format_ts(self, ts: int) -> str:
         if ts <= 0:
             return "-"
@@ -759,6 +813,59 @@ class ArticleSummaryService(Star):
             f"- 团队：{team}\n"
             f"- 知识库：{knowledge_base}"
         )
+
+    def _normalize_publish_prefix(self) -> str:
+        prefix = self._cfg_str("prefix", "slfk").strip().lstrip("/")
+        return prefix or "slfk"
+
+    def _is_group_message_context(self, event: AstrMessageEvent) -> bool:
+        message_type = self._safe_message_type(event).strip().lower()
+        if "group" in message_type:
+            return True
+        if message_type in ("private", "private_message", "friend", "friend_message", "dm"):
+            return False
+        group_id = self._safe_call(event, "get_group_id").strip()
+        return bool(group_id)
+
+    def _format_command_by_context(self, event: AstrMessageEvent, command: str) -> str:
+        normalized = str(command or "").strip()
+        if not normalized:
+            return ""
+        if self._is_group_message_context(event):
+            return f"/{self._normalize_publish_prefix()} {normalized}"
+        return normalized
+
+    def _build_publish_guide_text(self, event: AstrMessageEvent, article_id: int) -> str:
+        defaults: dict[str, Any] = {}
+        platform, account_id = self._resolve_user_scope(event)
+        if account_id:
+            defaults = self._ensure_repository().get_user_publish_defaults(platform, account_id) or {}
+
+        publish_cmd = self._format_command_by_context(
+            event,
+            f"发布文章 {max(0, article_id)} <空间> <团队> <知识库>",
+        )
+        set_space_cmd = self._format_command_by_context(event, "默认发布空间 <空间名或代号>")
+        set_team_cmd = self._format_command_by_context(event, "默认发布团队 <团队名或代号>")
+        set_kb_cmd = self._format_command_by_context(event, "默认发布知识库 <知识库名或代号>")
+        set_all_cmd = self._format_command_by_context(event, "默认发布 <空间> <团队> <知识库>")
+        return (
+            "[article-summary] 文章解析成功，可使用以下命令发布：\n"
+            f"{publish_cmd}\n\n"
+            f"{self._format_publish_defaults(defaults)}\n"
+            "设置默认发布配置命令：\n"
+            f"- {set_space_cmd}\n"
+            f"- {set_team_cmd}\n"
+            f"- {set_kb_cmd}\n"
+            f"- {set_all_cmd}"
+        )
+
+    async def _emit_publish_guide_result(self, event: AstrMessageEvent, article_id: int):
+        if article_id <= 0:
+            return
+        event.stop_event()
+        yield event.plain_result(self._build_publish_guide_text(event, article_id))
+        event.stop_event()
 
     def _resolve_run_dir(self, run_dir: str) -> Optional[Path]:
         text = str(run_dir or "").strip()
@@ -939,11 +1046,13 @@ class ArticleSummaryService(Star):
         text = str(raw or "").strip()
         if not text:
             return ""
-        text = text.rstrip(".,;:!?)\"]}'")
+        text = text.strip("`")
+        text = text.rstrip(".,;:!?)\"]}'`>，。；：！？）】」』》")
         match = URL_PATTERN.search(text)
         if not match:
             return ""
-        return str(match.group(0) or "").strip()
+        normalized = str(match.group(0) or "").strip()
+        return normalized.rstrip("`")
 
     def _remove_article_cache(self, article: dict) -> tuple[int, int]:
         removed = 0
@@ -1000,10 +1109,10 @@ class ArticleSummaryService(Star):
         cmd_text = self._cfg_str("codex_cmd", "codex --yolo").strip() or "codex --yolo"
         try:
             args = shlex.split(cmd_text)
-        except Exception as exc:
-            return [], f"codex_cmd 配置无法解析: {exc}"
+        except Exception:
+            return [], "抓取命令解析失败，请联系管理员检查后台配置。"
         if not args:
-            return [], "codex_cmd 为空"
+            return [], "抓取命令未配置，请联系管理员检查后台配置。"
 
         resolved_args = self._inject_prompt(args, prompt)
         if self._looks_like_interactive_codex(resolved_args):
@@ -1029,10 +1138,10 @@ class ArticleSummaryService(Star):
 
         try:
             args = shlex.split(template)
-        except Exception as exc:
-            return [], str(exc)
+        except Exception:
+            return [], "继续命令解析失败，请联系管理员检查后台配置。"
         if not args:
-            return [], "继续命令为空"
+            return [], "继续命令未配置，请联系管理员检查后台配置。"
 
         resolved: list[str] = []
         replaced = False
@@ -1232,6 +1341,8 @@ class ArticleSummaryService(Star):
             Comp.File(file=str(cache_path), name=cache_path.name),
         ])
         yield event.plain_result(outbound_text)
+        async for item in self._emit_publish_guide_result(event, article_id):
+            yield item
         logger.info(
             "[article-summary] done task=%s article=%s source=%s",
             task_id,
@@ -1272,6 +1383,8 @@ class ArticleSummaryService(Star):
         if not text:
             text = "文章已缓存，但未提取到可发送文本。"
         yield event.plain_result(text)
+        async for item in self._emit_publish_guide_result(event, article_id):
+            yield item
         logger.info("[article-summary] hit cache article=%s", article_id)
 
     def _ensure_cached_article_file(self, article: dict) -> Optional[Path]:
@@ -1710,6 +1823,8 @@ class ArticleSummaryService(Star):
         prompt_preview: str = "",
         progress_report_seconds_override: Optional[int] = None,
         send_progress_immediately: bool = False,
+        progress_title: str = PROGRESS_TITLE_SUMMARY,
+        include_web_search_in_progress: bool = True,
     ) -> tuple[str, str]:
         timeout_seconds = self._cfg_int("codex_timeout_seconds", 900)
         report_seconds = (
@@ -1817,6 +1932,8 @@ class ArticleSummaryService(Star):
                         elapsed_seconds,
                         progress_tick,
                         normalized_article_url,
+                        progress_title=progress_title,
+                        include_web_search=include_web_search_in_progress,
                     )
                     await self._send_progress_message(event, progress_text)
                 else:
@@ -1865,6 +1982,8 @@ class ArticleSummaryService(Star):
                         elapsed_seconds,
                         progress_tick,
                         normalized_article_url,
+                        progress_title=progress_title,
+                        include_web_search=include_web_search_in_progress,
                     )
                     await self._send_progress_message(event, progress_text)
                     next_report_at += report_seconds
@@ -2299,16 +2418,25 @@ class ArticleSummaryService(Star):
         elapsed_seconds: int,
         progress_tick: int,
         article_url: str,
+        progress_title: str = PROGRESS_TITLE_SUMMARY,
+        include_web_search: bool = True,
     ) -> str:
         minutes = elapsed_seconds // 60
         stats = self._collect_rollout_stats(tracker, progress_tick)
         normalized_url = str(article_url or "").strip() or "-"
-
+        title = str(progress_title or "").strip() or PROGRESS_TITLE_SUMMARY
+        if include_web_search:
+            return (
+                f"[{title}] 已过 {minutes} 分钟（第{progress_tick}次进度播报）：\n"
+                f"1. 工具调用次数：{stats['function_call_count']}\n"
+                f"2. 已进行额外搜索：{stats['web_search_call_count']}\n"
+                f"3. 已用 token：{stats['token_count']}\n\n"
+                f"原文章地址：{normalized_url}"
+            )
         return (
-            f"[文章总结中] 已过 {minutes} 分钟（第{progress_tick}次进度播报）：\n"
+            f"[{title}] 已过 {minutes} 分钟（第{progress_tick}次进度播报）：\n"
             f"1. 工具调用次数：{stats['function_call_count']}\n"
-            f"2. 已进行额外搜索：{stats['web_search_call_count']}\n"
-            f"3. 已用 token：{stats['token_count']}\n\n"
+            f"2. 已用 token：{stats['token_count']}\n\n"
             f"原文章地址：{normalized_url}"
         )
 
