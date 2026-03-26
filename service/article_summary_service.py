@@ -98,6 +98,14 @@ PUBLISH_PROMPT_NOT_FOUND_REQUIREMENT = (
     "2) 向用户说明当前可见的空间、团队、知识库列表，每一项都给出名称和 link；\n"
     "3) 明确指出未匹配发生在哪一层（空间/团队/知识库），并给出修正建议。"
 )
+PUBLISH_GUIDE_HEADER_TEXT = "[article-summary]"
+PUBLISH_GUIDE_TRIGGER_TEXT = "文章解析成功，可使用以下命令发布"
+PUBLISH_GUIDE_ARTICLE_ID_PATTERN = re.compile(r"发布文章\s+(\d+)")
+AUTO_PUBLISH_AT_SEGMENT_PATTERN = re.compile(
+    r"(?:\[CQ:at,[^\]]+\]|\[at:[^\]]+\]|<@!?[^>]+>|<at[^>]*>)",
+    re.IGNORECASE,
+)
+AUTO_PUBLISH_LEADING_AT_PATTERN = re.compile(r"^\s*[@＠](?:[^\s]+|\s+[^\s]+)\s*")
 
 
 class ArticleSummaryService(Star):
@@ -447,6 +455,7 @@ class ArticleSummaryService(Star):
         space_name: str = "",
         team_name: str = "",
         kb_name: str = "",
+        auto_publish_defaults: Optional[dict[str, str]] = None,
     ):
         event.stop_event()
         platform, account_id = self._resolve_user_scope(event)
@@ -558,11 +567,13 @@ class ArticleSummaryService(Star):
         )
         self._prepare_codex_workspace_config(run_dir)
 
+        defaults_prompt_block = self._build_publish_prompt_defaults_block(auto_publish_defaults)
         prompt = self._build_publish_prompt(
             article_file=article_file,
             space_name=space,
             team_name=team,
             knowledge_base_name=knowledge_base,
+            defaults_prompt_block=defaults_prompt_block,
         )
         codex_args, codex_args_error = self._build_codex_args(prompt)
         if codex_args_error:
@@ -716,6 +727,32 @@ class ArticleSummaryService(Star):
             )
             return
 
+        reply_payload = self._extract_reply_payload(event)
+        reply_id = self._extract_reply_id(reply_payload) if reply_payload is not None else ""
+        auto_publish_action, fetched_reply_payload = await self._resolve_auto_publish_reply_action(
+            event=event,
+            message_id=message_id,
+            reply_payload=reply_payload,
+            reply_id=reply_id,
+        )
+        if auto_publish_action is not None:
+            event.stop_event()
+            auto_error = str(auto_publish_action.get("error") or "").strip()
+            if auto_error:
+                yield event.plain_result(auto_error)
+                yield self._stop_sentinel_result()
+                return
+            async for item in self.publish_article_command(
+                event,
+                str(auto_publish_action.get("article_id") or ""),
+                str(auto_publish_action.get("space") or ""),
+                str(auto_publish_action.get("team") or ""),
+                str(auto_publish_action.get("knowledge_base") or ""),
+                auto_publish_defaults=auto_publish_action.get("prompt_defaults") or {},
+            ):
+                yield item
+            return
+
         bot_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
         at_targets = self._collect_at_targets(event)
         if not self._is_at_bot(event):
@@ -727,7 +764,6 @@ class ArticleSummaryService(Star):
             )
             return
 
-        reply_payload = self._extract_reply_payload(event)
         if reply_payload is None:
             logger.info(
                 "[article-summary] skip id=%s reason=no_reply_payload raw_type=%s",
@@ -739,10 +775,11 @@ class ArticleSummaryService(Star):
         href = self._extract_first_url(reply_payload)
         if not href:
             href = self._extract_reply_preview_url(event)
+        if not href and fetched_reply_payload is not None:
+            href = self._extract_first_url(fetched_reply_payload)
 
         if not href:
-            reply_id = self._extract_reply_id(reply_payload)
-            if reply_id:
+            if reply_id and fetched_reply_payload is None:
                 logger.info(
                     "[article-summary] try_get_msg id=%s reply_id=%s",
                     message_id or "-",
@@ -830,6 +867,12 @@ class ArticleSummaryService(Star):
         platform = self._safe_platform_name(event) or "unknown"
         account_id = self._safe_call(event, "get_sender_id").strip()
         return platform, account_id
+
+    def _get_user_publish_defaults_by_event(self, event: AstrMessageEvent) -> dict[str, Any]:
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            return {}
+        return self._ensure_repository().get_user_publish_defaults(platform, account_id) or {}
 
     def _parse_int(self, value: Any) -> int:
         try:
@@ -970,6 +1013,265 @@ class ArticleSummaryService(Star):
             f"- 知识库：{knowledge_base}"
         )
 
+    def _extract_publish_default_values(self, defaults: Optional[dict[str, Any]]) -> tuple[str, str, str]:
+        payload = defaults or {}
+        space = str(payload.get("default_space") or payload.get("space") or "").strip()
+        team = str(payload.get("default_team") or payload.get("team") or "").strip()
+        knowledge_base = str(
+            payload.get("default_knowledge_base")
+            or payload.get("knowledge_base")
+            or payload.get("knowledgeBase")
+            or ""
+        ).strip()
+        return space, team, knowledge_base
+
+    def _build_publish_prompt_defaults_block(self, defaults: Optional[dict[str, Any]]) -> str:
+        space, team, knowledge_base = self._extract_publish_default_values(defaults)
+        if not space or not team or not knowledge_base:
+            return ""
+        return (
+            "[默认配置]\n"
+            f"空间={space}\n"
+            f"团队={team}\n"
+            f"知识库={knowledge_base}"
+        )
+
+    def _extract_publish_guide_article_id(self, payload: Any) -> int:
+        text_values = [str(item or "").strip() for item in self._iter_text_values(payload)]
+        text_values = [item for item in text_values if item]
+        if not text_values:
+            return 0
+        joined = "\n".join(text_values)
+        if PUBLISH_GUIDE_HEADER_TEXT not in joined or PUBLISH_GUIDE_TRIGGER_TEXT not in joined:
+            return 0
+        match = PUBLISH_GUIDE_ARTICLE_ID_PATTERN.search(joined)
+        if not match:
+            return 0
+        return self._parse_int(match.group(1))
+
+    async def _resolve_reply_publish_guide_context(
+        self,
+        event: AstrMessageEvent,
+        reply_payload: Optional[Any],
+        reply_id: str,
+    ) -> tuple[int, Optional[Any]]:
+        if reply_payload is None:
+            return 0, None
+
+        guide_article_id = self._extract_publish_guide_article_id(reply_payload)
+        if guide_article_id > 0 or not reply_id:
+            return guide_article_id, None
+
+        fetched_reply_payload = await self._fetch_reply_payload_by_id(event, reply_id)
+        if fetched_reply_payload is None:
+            return 0, None
+
+        guide_article_id = self._extract_publish_guide_article_id(fetched_reply_payload)
+        return guide_article_id, fetched_reply_payload
+
+    async def _resolve_auto_publish_reply_action(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+        reply_payload: Optional[Any],
+        reply_id: str,
+    ) -> tuple[Optional[dict[str, Any]], Optional[Any]]:
+        guide_article_id, fetched_reply_payload = await self._resolve_reply_publish_guide_context(
+            event=event,
+            reply_payload=reply_payload,
+            reply_id=reply_id,
+        )
+        if guide_article_id <= 0:
+            return None, fetched_reply_payload
+
+        reply_text = self._extract_reply_user_text(event)
+        if self._looks_like_publish_command_text(reply_text):
+            logger.info(
+                "[article-summary] skip auto_publish id=%s reason=explicit_publish_command",
+                message_id or "-",
+            )
+            return None, fetched_reply_payload
+
+        defaults = self._get_user_publish_defaults_by_event(event)
+        (
+            auto_space,
+            auto_team,
+            auto_kb,
+            auto_defaults_for_prompt,
+            auto_error,
+        ) = self._resolve_auto_publish_reply_targets(
+            event=event,
+            article_id=guide_article_id,
+            defaults=defaults,
+        )
+        logger.info(
+            "[article-summary] auto_publish matched id=%s article=%s defaults_in_prompt=%s",
+            message_id or "-",
+            guide_article_id,
+            bool(auto_defaults_for_prompt),
+        )
+        return (
+            {
+                "article_id": guide_article_id,
+                "space": auto_space,
+                "team": auto_team,
+                "knowledge_base": auto_kb,
+                "prompt_defaults": auto_defaults_for_prompt,
+                "error": auto_error,
+            },
+            fetched_reply_payload,
+        )
+
+    def _extract_reply_user_text(self, event: AstrMessageEvent) -> str:
+        parts: list[str] = []
+        for component in self._safe_get_messages(event):
+            component_type = component.__class__.__name__.lower()
+            if component_type in ("reply", "at"):
+                continue
+            candidate = ""
+            for attr in ("text", "message_str", "content"):
+                value = getattr(component, attr, None)
+                if isinstance(value, str) and value.strip():
+                    candidate = value.strip()
+                    break
+            if not candidate:
+                raw = self._segment_data(component)
+                if isinstance(raw, dict):
+                    for key in ("text", "content"):
+                        value = raw.get(key)
+                        if isinstance(value, str) and value.strip():
+                            candidate = value.strip()
+                            break
+            if candidate:
+                parts.append(candidate)
+        if parts:
+            return " ".join(parts).strip()
+        return str(getattr(event, "message_str", "") or "").strip()
+
+    def _split_quoted_args(self, text: str) -> list[str]:
+        normalized = self._normalize_auto_publish_reply_text(text)
+        if not normalized:
+            return []
+        try:
+            return [arg for arg in shlex.split(normalized) if str(arg).strip()]
+        except Exception:
+            return [arg for arg in normalized.split() if str(arg).strip()]
+
+    def _looks_like_publish_command_text(self, text: str) -> bool:
+        normalized = self._normalize_auto_publish_reply_text(text)
+        if not normalized:
+            return False
+        return bool(re.match(r"^/?(?:\S+\s+)?发布文章(?:\s|$)", normalized))
+
+    def _normalize_auto_publish_reply_text(self, text: str) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+
+        normalized = AUTO_PUBLISH_AT_SEGMENT_PATTERN.sub(" ", normalized)
+        normalized = MULTI_SPACE_PATTERN.sub(" ", normalized).strip()
+        while True:
+            updated = AUTO_PUBLISH_LEADING_AT_PATTERN.sub("", normalized, count=1).strip()
+            if updated == normalized:
+                break
+            normalized = updated
+        return normalized
+
+    def _collect_missing_publish_default_fields(
+        self,
+        default_space: str,
+        default_team: str,
+        default_knowledge_base: str,
+    ) -> list[tuple[str, str]]:
+        missing_fields: list[tuple[str, str]] = []
+        if not default_space:
+            missing_fields.append(("空间", "default_space"))
+        if not default_team:
+            missing_fields.append(("团队", "default_team"))
+        if not default_knowledge_base:
+            missing_fields.append(("知识库", "default_knowledge_base"))
+        return missing_fields
+
+    def _resolve_auto_publish_reply_targets(
+        self,
+        event: AstrMessageEvent,
+        article_id: int,
+        defaults: dict[str, Any],
+    ) -> tuple[str, str, str, dict[str, str], str]:
+        default_space, default_team, default_knowledge_base = self._extract_publish_default_values(defaults)
+        missing_fields = self._collect_missing_publish_default_fields(
+            default_space,
+            default_team,
+            default_knowledge_base,
+        )
+
+        if not missing_fields:
+            defaults_for_prompt = {
+                "default_space": default_space,
+                "default_team": default_team,
+                "default_knowledge_base": default_knowledge_base,
+            }
+            return default_space, default_team, default_knowledge_base, defaults_for_prompt, ""
+
+        reply_args = self._split_quoted_args(self._extract_reply_user_text(event))
+        if len(reply_args) < len(missing_fields):
+            required = " ".join(f"<{label}>" for label, _ in missing_fields)
+            publish_cmd = self._format_command_by_context(
+                event,
+                f"发布文章 {max(0, article_id)} <空间> <团队> <知识库名称>",
+            )
+            return (
+                "",
+                "",
+                "",
+                {},
+                "[article-summary] 自动发布缺少参数，请直接回复："
+                f"{required}\n"
+                "参数请用空格分割；若参数本身包含空格，请使用双引号包裹。\n"
+                f"{self._format_publish_defaults(defaults)}\n"
+                f"也可直接执行：{publish_cmd}",
+            )
+
+        merged = {
+            "default_space": default_space,
+            "default_team": default_team,
+            "default_knowledge_base": default_knowledge_base,
+        }
+        for index, (_, key) in enumerate(missing_fields):
+            if index == len(missing_fields) - 1:
+                value = " ".join(reply_args[index:]).strip()
+            else:
+                value = str(reply_args[index] or "").strip()
+            merged[key] = value
+
+        space = str(merged.get("default_space") or "").strip()
+        team = str(merged.get("default_team") or "").strip()
+        knowledge_base = str(merged.get("default_knowledge_base") or "").strip()
+        if not space or not team or not knowledge_base:
+            return "", "", "", {}, "[article-summary] 自动发布参数解析失败，请重新回复。"
+        return space, team, knowledge_base, {}, ""
+
+    def _build_auto_publish_reply_hint(self, defaults: dict[str, Any]) -> str:
+        default_space, default_team, default_knowledge_base = self._extract_publish_default_values(defaults)
+        missing_fields = [
+            label
+            for label, _ in self._collect_missing_publish_default_fields(
+                default_space,
+                default_team,
+                default_knowledge_base,
+            )
+        ]
+
+        if not missing_fields:
+            return "可直接回复本消息触发自动发布（将注入当前默认配置）。"
+
+        required = " ".join(f"<{field}>" for field in missing_fields)
+        return (
+            "可直接回复本消息补齐缺参（按顺序）："
+            f"{required}\n"
+            "参数请用空格分割；若参数本身包含空格，请使用双引号包裹。"
+        )
+
     def _normalize_publish_prefix(self) -> str:
         prefix = self._cfg_str("prefix", "slfk").strip().lstrip("/")
         return prefix or "slfk"
@@ -992,10 +1294,7 @@ class ArticleSummaryService(Star):
         return normalized
 
     def _build_publish_guide_text(self, event: AstrMessageEvent, article_id: int) -> str:
-        defaults: dict[str, Any] = {}
-        platform, account_id = self._resolve_user_scope(event)
-        if account_id:
-            defaults = self._ensure_repository().get_user_publish_defaults(platform, account_id) or {}
+        defaults = self._get_user_publish_defaults_by_event(event)
 
         publish_cmd = self._format_command_by_context(
             event,
@@ -1013,6 +1312,7 @@ class ArticleSummaryService(Star):
         set_team_cmd = self._format_command_by_context(event, "默认发布团队 <团队名或代号>")
         set_kb_cmd = self._format_command_by_context(event, "默认发布知识库 <知识库名或代号>")
         set_all_cmd = self._format_command_by_context(event, "默认发布 <空间> <团队> <知识库>")
+        auto_publish_hint = self._build_auto_publish_reply_hint(defaults)
         return (
             "[article-summary] 文章解析成功，可使用以下命令发布：\n"
             f"{publish_cmd}\n\n"
@@ -1020,6 +1320,7 @@ class ArticleSummaryService(Star):
             f"- {publish_cmd_team_kb}（需已设置默认空间）\n"
             f"- {publish_cmd_kb}（需已设置默认空间和默认团队）\n\n"
             f"{self._format_publish_defaults(defaults)}\n"
+            f"{auto_publish_hint}\n"
             "设置默认发布配置命令：\n"
             f"- {set_space_cmd}\n"
             f"- {set_team_cmd}\n"
@@ -1066,6 +1367,7 @@ class ArticleSummaryService(Star):
         space_name: str,
         team_name: str,
         knowledge_base_name: str,
+        defaults_prompt_block: str = "",
     ) -> str:
         template = self._cfg_str(
             "codex_publish_prompt_template",
@@ -1086,7 +1388,12 @@ class ArticleSummaryService(Star):
                 f"{article_file} 内容发布到 {space_name} 空间 {team_name} 团队下的 "
                 f"{knowledge_base_name} 知识库中，并且要注意优先处理图片上传和文章内图片链接替换的逻辑"
             )
-        return f"{prompt.rstrip()}\n\n{PUBLISH_PROMPT_NOT_FOUND_REQUIREMENT}"
+        sections = [prompt.rstrip()]
+        defaults_block = str(defaults_prompt_block or "").strip()
+        if defaults_block:
+            sections.append(defaults_block)
+        sections.append(PUBLISH_PROMPT_NOT_FOUND_REQUIREMENT)
+        return "\n\n".join(sections)
 
     def _extract_first_publish_url(self, run_dir: Path) -> str:
         first_url_fallback = ""
