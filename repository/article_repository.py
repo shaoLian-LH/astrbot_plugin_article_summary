@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import time
 from typing import Iterable, Optional
 
@@ -79,6 +80,16 @@ class ArticleRepository(SQLiteRepositoryBase):
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS user_knowledgebase_credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
+                password_base64 TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             """
         )
 
@@ -146,6 +157,9 @@ class ArticleRepository(SQLiteRepositoryBase):
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_user_publish_defaults_owner
             ON user_publish_defaults(platform, account_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_kb_credentials_owner
+            ON user_knowledgebase_credentials(platform, account_id);
             """
         )
 
@@ -781,6 +795,59 @@ class ArticleRepository(SQLiteRepositoryBase):
         refreshed = self.get_user_publish_defaults(platform, account_id)
         if refreshed is None:
             raise RuntimeError("读取发布默认配置失败")
+        return refreshed
+
+    def get_user_knowledgebase_credential(self, platform: str, account_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT platform, account_id, username, password_base64,
+                       created_at, updated_at
+                FROM user_knowledgebase_credentials
+                WHERE platform = ? AND account_id = ?
+                """,
+                (platform, account_id),
+            ).fetchone()
+        return self._to_dict(row) or None
+
+    def upsert_user_knowledgebase_credential(
+        self,
+        platform: str,
+        account_id: str,
+        username: str,
+        password_plain: str,
+    ) -> dict:
+        now = self._now()
+        current = self.get_user_knowledgebase_credential(platform, account_id) or {}
+
+        username_value = str(username or "").strip()
+        password_base64 = base64.b64encode(str(password_plain or "").encode("utf-8")).decode("ascii")
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_knowledgebase_credentials (
+                    platform, account_id, username, password_base64, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, account_id) DO UPDATE SET
+                    username = excluded.username,
+                    password_base64 = excluded.password_base64,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    platform,
+                    account_id,
+                    username_value,
+                    password_base64,
+                    int(current.get("created_at") or now),
+                    now,
+                ),
+            )
+
+        refreshed = self.get_user_knowledgebase_credential(platform, account_id)
+        if refreshed is None:
+            raise RuntimeError("读取知识库账户凭证失败")
         return refreshed
 
     def resolve_article_owner(self, article_id: int) -> Optional[dict]:

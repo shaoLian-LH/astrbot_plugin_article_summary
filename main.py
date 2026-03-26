@@ -15,6 +15,7 @@ if __package__:
         handle_set_default_publish_kb_command,
         handle_set_default_publish_space_command,
         handle_set_default_publish_team_command,
+        handle_set_knowledgebase_account_command,
     )
     from .service.article_summary_service import ArticleSummaryService
     from .utils.constants import PLUGIN_NAME, PLUGIN_VERSION
@@ -31,6 +32,7 @@ else:
         handle_set_default_publish_kb_command,
         handle_set_default_publish_space_command,
         handle_set_default_publish_team_command,
+        handle_set_knowledgebase_account_command,
     )
     from service.article_summary_service import ArticleSummaryService
     from utils.constants import PLUGIN_NAME, PLUGIN_VERSION
@@ -106,6 +108,21 @@ class ArticleSummaryPlugin(ArticleSummaryService):
             space_name,
             team_name,
             kb_name,
+        ):
+            yield item
+
+    @filter.command("知识库账户", alias={"/知识库账户", "知识库账户"})
+    async def set_knowledgebase_account_command(
+        self,
+        event: AstrMessageEvent,
+        username: str = "",
+        password: str = "",
+    ):
+        async for item in handle_set_knowledgebase_account_command(
+            self,
+            event,
+            username,
+            password,
         ):
             yield item
 

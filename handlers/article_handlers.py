@@ -100,6 +100,21 @@ async def handle_set_default_publish_command(
         yield item
 
 
+async def handle_set_knowledgebase_account_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+    username: str = "",
+    password: str = "",
+):
+    async for item in ArticleSummaryService.set_knowledgebase_account_command(
+        plugin,
+        event,
+        username,
+        password,
+    ):
+        yield item
+
+
 async def handle_publish_article_command(
     plugin: ArticleSummaryService,
     event: AstrMessageEvent,
