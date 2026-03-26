@@ -539,7 +539,23 @@ class ArticleSummaryService(Star):
             yield self._stop_sentinel_result()
             return
 
-        run_dir = self._create_publish_run_dir(event, target_article_id)
+        run_dir_text = str(article.get("last_run_dir") or "").strip()
+        run_dir = self._resolve_run_dir(run_dir_text)
+        if run_dir is None or not run_dir.is_dir():
+            run_dir_display = run_dir_text or "-"
+            run_dir_error = (
+                "该文章缺少可复用的抓取工作空间"
+                f"（last_run_dir={run_dir_display}），请重新获取文章后再发布。"
+            )
+            repo.set_article_publish_failed(target_article_id, run_dir_error)
+            yield event.plain_result(f"[article-summary] 发布失败：{run_dir_error}")
+            yield self._stop_sentinel_result()
+            return
+        logger.info(
+            "[article-summary] publish reuse run_dir article=%s run_dir=%s",
+            target_article_id,
+            run_dir,
+        )
         self._prepare_codex_workspace_config(run_dir)
 
         prompt = self._build_publish_prompt(
@@ -1037,18 +1053,6 @@ class ArticleSummaryService(Star):
         message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = work_root / f"{timestamp}-t{max(0, task_id)}-{message_id}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return run_dir
-
-    def _create_publish_run_dir(self, event: AstrMessageEvent, article_id: int) -> Path:
-        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
-        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
-        if not work_root.is_absolute():
-            work_root = Path.cwd() / work_root
-
-        message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = work_root / f"{timestamp}-publish-a{max(0, article_id)}-{message_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
@@ -1622,7 +1626,6 @@ class ArticleSummaryService(Star):
             return
 
         codex_dir = run_dir / ".codex"
-        codex_dir.mkdir(parents=True, exist_ok=True)
         codex_config_path = codex_dir / "config.toml"
 
         lines = []
@@ -1633,7 +1636,16 @@ class ArticleSummaryService(Star):
             lines.append(f'reasoning_effort = "{escaped}"')
             lines.append(f'model_reasoning_effort = "{escaped}"')
 
-        codex_config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            codex_dir.mkdir(parents=True, exist_ok=True)
+            codex_config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "failed to prepare codex config target=%s err=%s",
+                codex_config_path,
+                exc,
+            )
+            return
         logger.info(
             "prepared codex config: model=%s reasoning=%s source=%s target=%s",
             model or "-",
