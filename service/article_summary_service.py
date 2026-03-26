@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageChain
+from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult
 from astrbot.api.star import Context, Star
 if __package__ and __package__.count(".") >= 1:
     from ..infrastructure.sqlite_base import DEFAULT_ARTICLE_CACHE_ROOT, DEFAULT_DB_PATH
@@ -130,16 +130,21 @@ class ArticleSummaryService(Star):
     async def terminate(self):
         await self._stop_all_running_codex("插件停止，已停止正在获取的文章。")
 
+    def _stop_sentinel_result(self):
+        return MessageEventResult().stop_event()
+
     async def list_article_tasks_command(self, event: AstrMessageEvent):
         event.stop_event()
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         tasks = self._ensure_repository().list_user_tasks(platform, account_id)
         if not tasks:
             yield event.plain_result("[article-summary] 当前没有可查看的文章任务。")
+            yield self._stop_sentinel_result()
             return
 
         visible_tasks: list[dict] = []
@@ -160,6 +165,7 @@ class ArticleSummaryService(Star):
 
         if not visible_tasks:
             yield event.plain_result("[article-summary] 当前没有正在获取/已停止/待发布的完成文章。")
+            yield self._stop_sentinel_result()
             return
 
         lines = [f"[article-summary] 获取文章列表（完成项最多展示 {TASK_LIST_COMPLETED_LIMIT} 条）："]
@@ -182,23 +188,27 @@ class ArticleSummaryService(Star):
                 line += f" 可继续：/继续获取文章 {task_id}"
             lines.append(line)
         yield event.plain_result("\n".join(lines))
+        yield self._stop_sentinel_result()
 
     async def resume_article_command(self, event: AstrMessageEvent, item_id: str = ""):
         event.stop_event()
         task_id = self._parse_int(item_id)
         if task_id <= 0:
             yield event.plain_result("[article-summary] 用法：/继续获取文章 <列表项id>")
+            yield self._stop_sentinel_result()
             return
 
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         repo = self._ensure_repository()
         task = repo.get_task_by_id_for_owner(task_id, platform, account_id)
         if task is None:
             yield event.plain_result("[article-summary] 未找到该列表项，或你没有权限操作它。")
+            yield self._stop_sentinel_result()
             return
 
         task_status = str(task.get("status") or "")
@@ -209,12 +219,15 @@ class ArticleSummaryService(Star):
                     yield item
                 return
             yield event.plain_result("[article-summary] 该列表项已完成。")
+            yield self._stop_sentinel_result()
             return
         if task_status == TASK_STATUS_PROCESSING:
             yield event.plain_result("[article-summary] 该列表项正在处理中，请稍候。")
+            yield self._stop_sentinel_result()
             return
         if task_status != TASK_STATUS_STOPPED:
             yield event.plain_result(f"[article-summary] 当前状态不支持继续：{task_status or '-'}")
+            yield self._stop_sentinel_result()
             return
 
         article_id = int(task.get("article_id") or 0)
@@ -228,6 +241,7 @@ class ArticleSummaryService(Star):
         session_id = str(task.get("session_id") or task.get("last_session_id") or "").strip()
         if not session_id:
             yield event.plain_result("[article-summary] 该任务没有可恢复的 session_id，无法继续。")
+            yield self._stop_sentinel_result()
             return
 
         run_dir = self._resolve_run_dir(str(task.get("run_dir") or ""))
@@ -239,6 +253,7 @@ class ArticleSummaryService(Star):
         resume_args, resume_error = self._build_resume_codex_args(session_id)
         if resume_error:
             yield event.plain_result(f"[article-summary] 无法构建继续命令: {resume_error}")
+            yield self._stop_sentinel_result()
             return
 
         repo.update_task_status(
@@ -265,12 +280,14 @@ class ArticleSummaryService(Star):
     async def article_summary_help_command(self, event: AstrMessageEvent):
         event.stop_event()
         yield event.plain_result(self._build_help_text())
+        yield self._stop_sentinel_result()
 
     async def set_default_publish_space_command(self, event: AstrMessageEvent, space_name: str = ""):
         event.stop_event()
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         args = self._get_command_args(event, ("默认发布空间",), [space_name])
@@ -282,11 +299,13 @@ class ArticleSummaryService(Star):
                 f"[article-summary] 当前默认发布空间：{value}\n"
                 "设置方式：/默认发布空间 <空间名或代号>"
             )
+            yield self._stop_sentinel_result()
             return
 
         target = " ".join(args).strip()
         if not target:
             yield event.plain_result("[article-summary] 用法：/默认发布空间 <空间名或代号>")
+            yield self._stop_sentinel_result()
             return
 
         saved = repo.upsert_user_publish_defaults(
@@ -298,12 +317,14 @@ class ArticleSummaryService(Star):
             f"[article-summary] 默认发布空间已设置为：{saved.get('default_space') or '-'}\n"
             f"{self._format_publish_defaults(saved)}"
         )
+        yield self._stop_sentinel_result()
 
     async def set_default_publish_team_command(self, event: AstrMessageEvent, team_name: str = ""):
         event.stop_event()
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         args = self._get_command_args(event, ("默认发布团队",), [team_name])
@@ -315,11 +336,13 @@ class ArticleSummaryService(Star):
                 f"[article-summary] 当前默认发布团队：{value}\n"
                 "设置方式：/默认发布团队 <团队名或代号>"
             )
+            yield self._stop_sentinel_result()
             return
 
         target = " ".join(args).strip()
         if not target:
             yield event.plain_result("[article-summary] 用法：/默认发布团队 <团队名或代号>")
+            yield self._stop_sentinel_result()
             return
 
         saved = repo.upsert_user_publish_defaults(
@@ -331,12 +354,14 @@ class ArticleSummaryService(Star):
             f"[article-summary] 默认发布团队已设置为：{saved.get('default_team') or '-'}\n"
             f"{self._format_publish_defaults(saved)}"
         )
+        yield self._stop_sentinel_result()
 
     async def set_default_publish_kb_command(self, event: AstrMessageEvent, kb_name: str = ""):
         event.stop_event()
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         args = self._get_command_args(event, ("默认发布知识库",), [kb_name])
@@ -348,11 +373,13 @@ class ArticleSummaryService(Star):
                 f"[article-summary] 当前默认发布知识库：{value}\n"
                 "设置方式：/默认发布知识库 <知识库名或代号>"
             )
+            yield self._stop_sentinel_result()
             return
 
         target = " ".join(args).strip()
         if not target:
             yield event.plain_result("[article-summary] 用法：/默认发布知识库 <知识库名或代号>")
+            yield self._stop_sentinel_result()
             return
 
         saved = repo.upsert_user_publish_defaults(
@@ -364,6 +391,7 @@ class ArticleSummaryService(Star):
             f"[article-summary] 默认发布知识库已设置为：{saved.get('default_knowledge_base') or '-'}\n"
             f"{self._format_publish_defaults(saved)}"
         )
+        yield self._stop_sentinel_result()
 
     async def set_default_publish_command(
         self,
@@ -376,6 +404,7 @@ class ArticleSummaryService(Star):
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         args = self._get_command_args(event, ("默认发布",), [space_name, team_name, kb_name])
@@ -386,6 +415,7 @@ class ArticleSummaryService(Star):
                 "[article-summary] 用法：/默认发布 <空间> <团队> <知识库>\n"
                 f"{self._format_publish_defaults(current)}"
             )
+            yield self._stop_sentinel_result()
             return
 
         space = str(args[0] or "").strip()
@@ -393,6 +423,7 @@ class ArticleSummaryService(Star):
         knowledge_base = " ".join(args[2:]).strip()
         if not space or not team or not knowledge_base:
             yield event.plain_result("[article-summary] 用法：/默认发布 <空间> <团队> <知识库>")
+            yield self._stop_sentinel_result()
             return
 
         repo = self._ensure_repository()
@@ -407,6 +438,7 @@ class ArticleSummaryService(Star):
             "[article-summary] 默认发布配置已更新。\n"
             f"{self._format_publish_defaults(saved)}"
         )
+        yield self._stop_sentinel_result()
 
     async def publish_article_command(
         self,
@@ -420,22 +452,28 @@ class ArticleSummaryService(Star):
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         args = self._get_command_args(event, ("发布文章",), [article_id, space_name, team_name, kb_name])
         if not args:
             yield event.plain_result("[article-summary] 用法：/发布文章 <文章ID> [空间] [团队] [知识库名称]")
+            yield self._stop_sentinel_result()
             return
 
         target_article_id = self._parse_int(args[0])
         if target_article_id <= 0:
-            yield event.plain_result("[article-summary] 文章ID无效。用法：/发布文章 <文章ID> [空间] [团队] [知识库名称]")
+            yield event.plain_result(
+                "[article-summary] 文章ID无效。用法：/发布文章 <文章ID> [空间] [团队] [知识库名称]",
+            )
+            yield self._stop_sentinel_result()
             return
 
         repo = self._ensure_repository()
         article = repo.get_article_by_id(target_article_id)
         if article is None:
             yield event.plain_result(f"[article-summary] 未找到文章 {target_article_id}。")
+            yield self._stop_sentinel_result()
             return
 
         article_status = str(article.get("status") or "").strip()
@@ -443,14 +481,14 @@ class ArticleSummaryService(Star):
             str(article.get("article_file_path") or "").strip()
         )
         if article_status != ARTICLE_STATUS_COMPLETED or not has_content:
-            yield event.plain_result(
-                f"[article-summary] 文章 {target_article_id} 尚未解析完成，暂不可发布。"
-            )
+            yield event.plain_result(f"[article-summary] 文章 {target_article_id} 尚未解析完成，暂不可发布。")
+            yield self._stop_sentinel_result()
             return
 
         article_file = self._ensure_cached_article_file(article)
         if article_file is None or not article_file.is_file():
             yield event.plain_result("[article-summary] 未找到 article.md 缓存文件，无法发布。")
+            yield self._stop_sentinel_result()
             return
 
         defaults = repo.get_user_publish_defaults(platform, account_id) or {}
@@ -472,6 +510,7 @@ class ArticleSummaryService(Star):
                 f"{self._format_publish_defaults(defaults)}\n"
                 f"完整写法示例：{publish_cmd}"
             )
+            yield self._stop_sentinel_result()
             return
 
         space, team, knowledge_base, missing = self._resolve_publish_targets(
@@ -497,6 +536,7 @@ class ArticleSummaryService(Star):
                 f"- {set_kb_cmd}\n"
                 f"或直接执行：{set_all_cmd}"
             )
+            yield self._stop_sentinel_result()
             return
 
         run_dir = self._create_publish_run_dir(event, target_article_id)
@@ -512,6 +552,7 @@ class ArticleSummaryService(Star):
         if codex_args_error:
             repo.set_article_publish_failed(target_article_id, codex_args_error)
             yield event.plain_result(f"[article-summary] 发布失败：{codex_args_error}")
+            yield self._stop_sentinel_result()
             return
 
         temp_task_id = self._next_ephemeral_codex_task_id()
@@ -535,15 +576,16 @@ class ArticleSummaryService(Star):
             repo.set_article_publish_failed(target_article_id, codex_error)
             failure_diag = self._build_publish_failure_diagnostics(run_dir)
             diag_text = f"\n{failure_diag}" if failure_diag else ""
-            yield event.plain_result(
-                f"[article-summary] 发布失败：{codex_error}\n"
-                f"{self._format_publish_defaults(defaults)}{diag_text}"
-            )
             logger.warning(
                 "[article-summary] publish failed article=%s err=%s",
                 target_article_id,
                 codex_error,
             )
+            yield event.plain_result(
+                f"[article-summary] 发布失败：{codex_error}\n"
+                f"{self._format_publish_defaults(defaults)}{diag_text}"
+            )
+            yield self._stop_sentinel_result()
             return
 
         repo.set_article_publish_published(target_article_id, last_error="")
@@ -554,37 +596,53 @@ class ArticleSummaryService(Star):
                 target_article_id,
                 share_url,
             )
+            yield event.plain_result(
+                "[article-summary] 发布成功："
+                f"文章 {target_article_id} 已发布到空间[{space}] / 团队[{team}] / 知识库[{knowledge_base}]。\n"
+                f"分享链接：{share_url}",
+            )
+            yield self._stop_sentinel_result()
             return
         logger.info("[article-summary] publish done article=%s", target_article_id)
+        yield event.plain_result(
+            "[article-summary] 发布成功："
+            f"文章 {target_article_id} 已发布到空间[{space}] / 团队[{team}] / 知识库[{knowledge_base}]。",
+        )
+        yield self._stop_sentinel_result()
 
     async def delete_article_command(self, event: AstrMessageEvent, article_id: str = ""):
         event.stop_event()
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         args = self._get_command_args(event, ("删除文章",), [article_id])
         target_article_id = self._parse_int(args[0] if args else article_id)
         if target_article_id <= 0:
             yield event.plain_result("[article-summary] 用法：/删除文章 <文章ID>")
+            yield self._stop_sentinel_result()
             return
 
         repo = self._ensure_repository()
         article = repo.get_article_by_id(target_article_id)
         if article is None:
             yield event.plain_result(f"[article-summary] 未找到文章 {target_article_id}。")
+            yield self._stop_sentinel_result()
             return
 
         owner = repo.resolve_article_owner(target_article_id)
         if owner is None:
             yield event.plain_result("[article-summary] 该文章缺少创建者信息，无法执行删除。")
+            yield self._stop_sentinel_result()
             return
 
         owner_platform = str(owner.get("platform") or "").strip()
         owner_account = str(owner.get("account_id") or "").strip()
         if owner_platform != platform or owner_account != account_id:
             yield event.plain_result("[article-summary] 仅文章创建者可删除该文章缓存。")
+            yield self._stop_sentinel_result()
             return
 
         try:
@@ -592,10 +650,12 @@ class ArticleSummaryService(Star):
         except Exception as exc:
             logger.warning("[article-summary] delete article db failed article=%s err=%s", target_article_id, exc)
             yield event.plain_result(f"[article-summary] 删除失败：数据库删除异常（{exc}）。")
+            yield self._stop_sentinel_result()
             return
 
         if int(delete_result.get("article_deleted") or 0) <= 0:
             yield event.plain_result("[article-summary] 删除失败，数据库记录未变更。")
+            yield self._stop_sentinel_result()
             return
 
         deleted_files, failed_files = self._remove_article_cache(article)
@@ -604,6 +664,7 @@ class ArticleSummaryService(Star):
                 f"[article-summary] 文章 {target_article_id} 的数据库记录已删除，"
                 f"但缓存清理部分失败（成功 {deleted_files} 项，失败 {failed_files} 项）。"
             )
+            yield self._stop_sentinel_result()
             return
 
         yield event.plain_result(
@@ -611,6 +672,7 @@ class ArticleSummaryService(Star):
             f"任务记录删除 {int(delete_result.get('task_deleted') or 0)} 条，"
             f"缓存清理成功 {deleted_files} 项。"
         )
+        yield self._stop_sentinel_result()
 
     async def on_group_message(self, event: AstrMessageEvent):
         message_id = str(getattr(event.message_obj, "message_id", "") or "")
@@ -954,6 +1016,7 @@ class ArticleSummaryService(Star):
             return
         event.stop_event()
         yield event.plain_result(self._build_publish_guide_text(event, article_id))
+        yield self._stop_sentinel_result()
         event.stop_event()
 
     def _resolve_run_dir(self, run_dir: str) -> Optional[Path]:
@@ -1249,12 +1312,14 @@ class ArticleSummaryService(Star):
         platform, account_id = self._resolve_user_scope(event)
         if not account_id:
             yield event.plain_result("[article-summary] 无法识别当前用户。")
+            yield self._stop_sentinel_result()
             return
 
         repo = self._ensure_repository()
         normalized_url = self._normalize_url(href)
         if not normalized_url:
             yield event.plain_result("[article-summary] 链接解析失败。")
+            yield self._stop_sentinel_result()
             return
 
         article = repo.create_or_get_article(
@@ -1266,6 +1331,7 @@ class ArticleSummaryService(Star):
         article_id = int(article.get("id") or 0)
         if article_id <= 0:
             yield event.plain_result("[article-summary] 文章记录创建失败。")
+            yield self._stop_sentinel_result()
             return
 
         article_status = str(article.get("status") or "")
@@ -1308,6 +1374,7 @@ class ArticleSummaryService(Star):
                         f"[article-summary] 该链接当前为停止状态（列表项 {task_id}），"
                         f"可执行 /继续获取文章 {task_id}。"
                     )
+                yield self._stop_sentinel_result()
                 return
 
         task = repo.ensure_user_task_for_article(
@@ -1335,6 +1402,7 @@ class ArticleSummaryService(Star):
         if codex_args_error:
             self._mark_task_stopped(task_id, article_id, codex_args_error, "")
             yield event.plain_result(f"[article-summary] 处理失败: {codex_args_error}")
+            yield self._stop_sentinel_result()
             return
 
         async for item in self._execute_article_task(
@@ -1373,6 +1441,7 @@ class ArticleSummaryService(Star):
                 f"[article-summary] 处理失败: {codex_error}\n"
                 f"可执行 /继续获取文章 {task_id} 继续。"
             )
+            yield self._stop_sentinel_result()
             return
 
         article_path = self._find_latest_article(run_dir)
@@ -1380,6 +1449,7 @@ class ArticleSummaryService(Star):
             error_text = "未找到 article.md，请检查 Codex 输出。"
             self._mark_task_stopped(task_id, article_id, error_text, session_id)
             yield event.plain_result(f"[article-summary] {error_text}")
+            yield self._stop_sentinel_result()
             return
 
         try:
@@ -1389,6 +1459,7 @@ class ArticleSummaryService(Star):
             logger.exception("failed to read article.md: %s", exc)
             self._mark_task_stopped(task_id, article_id, error_text, session_id)
             yield event.plain_result(f"[article-summary] {error_text}")
+            yield self._stop_sentinel_result()
             return
 
         article_text = self._extract_readable_text(article_markdown)
@@ -1431,14 +1502,14 @@ class ArticleSummaryService(Star):
             Comp.File(file=str(cache_path), name=cache_path.name),
         ])
         yield event.plain_result(outbound_text)
-        async for item in self._emit_publish_guide_result(event, article_id):
-            yield item
         logger.info(
             "[article-summary] done task=%s article=%s source=%s",
             task_id,
             article_id,
             source_url,
         )
+        async for item in self._emit_publish_guide_result(event, article_id):
+            yield item
 
     def _mark_task_stopped(self, task_id: int, article_id: int, error_text: str, session_id: str) -> None:
         repo = self._ensure_repository()
@@ -1473,9 +1544,9 @@ class ArticleSummaryService(Star):
         if not text:
             text = "文章已缓存，但未提取到可发送文本。"
         yield event.plain_result(text)
+        logger.info("[article-summary] hit cache article=%s", article_id)
         async for item in self._emit_publish_guide_result(event, article_id):
             yield item
-        logger.info("[article-summary] hit cache article=%s", article_id)
 
     def _ensure_cached_article_file(self, article: dict) -> Optional[Path]:
         path_text = str(article.get("article_file_path") or "").strip()

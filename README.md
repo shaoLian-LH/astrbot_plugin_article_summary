@@ -81,6 +81,6 @@
 - 若 `codex_cmd` 是交互式（如 `codex --yolo`），插件会自动切换到 `codex_non_interactive_cmd` 执行，避免 `stdin is not a terminal`。
 - 默认非交互命令会启用 `--yolo` 并继承容器环境变量（`shell_environment_policy.inherit=all`），用于避免 `bun`/本地端口监听在沙箱内被拦截；如需更严格权限，请改写这两个命令配置。
 - 抓取/继续流程：若 Codex 执行超过 `codex_progress_report_seconds`（默认 120 秒），插件会分段扫描 rollout jsonl 并播报进度。
-- 发布流程（`/发布文章`）：开始时先发送固定文案；若发布耗时较长，会固定每 120 秒发送进度汇总；失败时会回传失败原因与日志诊断摘要。
+- 发布流程（`/发布文章`）：开始时先发送固定文案；若发布耗时较长，会固定每 120 秒发送进度汇总；失败时会回传失败原因与日志诊断摘要；成功时会回传文章 ID、发布目标与分享链接（若可解析）。
 - 进度消息格式：抓取/继续为 `[文章总结中]`（展示工具调用数、额外搜索数、累计 token 与原文地址）。
 - 进度中的 `token` 取自 rollout `event_msg.token_count.info.total_token_usage.total_tokens` 的最新值。
