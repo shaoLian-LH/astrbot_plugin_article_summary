@@ -92,6 +92,14 @@ PROGRESS_TITLE_VERIFY_ACCOUNT = "账户验证中"
 PUBLISH_PROGRESS_REPORT_SECONDS = 120
 VERIFY_ACCOUNT_MODEL = "gpt-5.4"
 VERIFY_ACCOUNT_REASONING = "low"
+WEEKLY_SUMMARY_MODEL = "gpt-5.4"
+WEEKLY_SUMMARY_REASONING = "low"
+WEEKLY_SUMMARY_WINDOW_SECONDS = 7 * 24 * 3600
+WEEKLY_SUMMARY_MAX_ARTICLES = 120
+PROGRESS_TITLE_WEEKLY_VERIFY = "每周总结链接校验中"
+PROGRESS_TITLE_WEEKLY_SUMMARY = "每周总结生成中"
+WEEKLY_SUMMARY_OUTPUT_BEGIN = "[WEEKLY_SUMMARY_BEGIN]"
+WEEKLY_SUMMARY_OUTPUT_END = "[WEEKLY_SUMMARY_END]"
 VERIFY_USERNAME_MAX_CHARS = 128
 VERIFY_PASSWORD_MAX_CHARS = 1024
 PUBLISH_TARGET_MAX_CHARS = 200
@@ -103,6 +111,11 @@ VERIFY_RESULT_CODE_BLOCK_PATTERN = re.compile(
     r"```(?:json)?\s*(\{[\s\S]*?\})\s*```",
     re.IGNORECASE,
 )
+WEEKLY_SUMMARY_SECTION_PATTERN = re.compile(
+    r"\[WEEKLY_SUMMARY_BEGIN\]\s*([\s\S]*?)\s*\[WEEKLY_SUMMARY_END\]",
+    re.IGNORECASE,
+)
+MARKDOWN_HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 PUBLISH_PROMPT_NOT_FOUND_REQUIREMENT = (
     "【必须遵守】若未找到对应的空间、团队或知识库：\n"
     "1) 立即停止发布，不得猜测或自动改用其他目标；\n"
@@ -303,6 +316,151 @@ class ArticleSummaryService(Star):
     async def article_summary_help_command(self, event: AstrMessageEvent):
         event.stop_event()
         yield event.plain_result(self._build_help_text())
+        yield self._stop_sentinel_result()
+
+    async def weekly_summary_command(self, event: AstrMessageEvent):
+        event.stop_event()
+        now_ts = int(datetime.now().timestamp())
+        since_ts = max(0, now_ts - WEEKLY_SUMMARY_WINDOW_SECONDS)
+
+        repo = self._ensure_repository()
+        articles = repo.list_recent_published_articles(
+            since_ts=since_ts,
+            limit=WEEKLY_SUMMARY_MAX_ARTICLES,
+        )
+        if not articles:
+            yield event.plain_result("[article-summary] 近 7 天内没有已发布文章。")
+            yield self._stop_sentinel_result()
+            return
+
+        candidates = self._build_weekly_summary_candidates(articles)
+        if not candidates:
+            yield event.plain_result("[article-summary] 近 7 天内没有可用于总结的有效候选文章。")
+            yield self._stop_sentinel_result()
+            return
+
+        verify_run_dir = self._create_weekly_summary_run_dir(event, phase="verify")
+        verify_input_file = verify_run_dir / "weekly-summary-candidates.json"
+        write_error = self._write_json_file(
+            verify_input_file,
+            {
+                "window_start_ts": since_ts,
+                "window_end_ts": now_ts,
+                "candidates": candidates,
+            },
+        )
+        if write_error:
+            yield event.plain_result(f"[article-summary] 生成每周总结失败：{write_error}")
+            yield self._stop_sentinel_result()
+            return
+
+        verify_prompt = self._build_weekly_verify_prompt(verify_input_file)
+        self._prepare_codex_workspace_config(
+            verify_run_dir,
+            force_model=WEEKLY_SUMMARY_MODEL,
+            force_reasoning=WEEKLY_SUMMARY_REASONING,
+        )
+        verify_args, verify_args_error = self._build_codex_args(verify_prompt)
+        if verify_args_error:
+            yield event.plain_result(f"[article-summary] 生成每周总结失败：{verify_args_error}")
+            yield self._stop_sentinel_result()
+            return
+
+        yield event.plain_result(
+            f"[article-summary] 正在校验近 7 天已发布文章链接（候选 {len(candidates)} 篇）..."
+        )
+        verify_task_id = self._next_ephemeral_codex_task_id()
+        verify_error, _ = await self._run_codex(
+            event=event,
+            run_dir=verify_run_dir,
+            resolved_args=verify_args,
+            task_id=verify_task_id,
+            article_id=0,
+            article_url="",
+            prompt_preview=verify_prompt,
+            progress_title=PROGRESS_TITLE_WEEKLY_VERIFY,
+            include_web_search_in_progress=False,
+        )
+        if verify_error:
+            yield event.plain_result(f"[article-summary] 每周总结失败：链接校验异常（{verify_error}）。")
+            yield self._stop_sentinel_result()
+            return
+
+        valid_items, invalid_count, verify_parse_error = self._extract_weekly_verify_valid_items(
+            verify_run_dir=verify_run_dir,
+            candidates=candidates,
+        )
+        if verify_parse_error:
+            yield event.plain_result(f"[article-summary] 每周总结失败：链接校验结果解析失败（{verify_parse_error}）。")
+            yield self._stop_sentinel_result()
+            return
+
+        if not valid_items:
+            yield event.plain_result(
+                f"[article-summary] 近 7 天文章链接校验完成：有效 0 / 候选 {len(candidates)}（无效 {invalid_count}），暂无可总结内容。"
+            )
+            yield self._stop_sentinel_result()
+            return
+
+        summary_run_dir = self._create_weekly_summary_run_dir(event, phase="summary")
+        summary_input_file = summary_run_dir / "weekly-summary-valid-items.json"
+        summary_write_error = self._write_json_file(
+            summary_input_file,
+            {
+                "window_start_ts": since_ts,
+                "window_end_ts": now_ts,
+                "valid_items": valid_items,
+            },
+        )
+        if summary_write_error:
+            yield event.plain_result(f"[article-summary] 生成每周总结失败：{summary_write_error}")
+            yield self._stop_sentinel_result()
+            return
+
+        summary_prompt = self._build_weekly_summary_prompt(summary_input_file)
+        self._prepare_codex_workspace_config(
+            summary_run_dir,
+            force_model=WEEKLY_SUMMARY_MODEL,
+            force_reasoning=WEEKLY_SUMMARY_REASONING,
+        )
+        summary_args, summary_args_error = self._build_codex_args(summary_prompt)
+        if summary_args_error:
+            yield event.plain_result(f"[article-summary] 生成每周总结失败：{summary_args_error}")
+            yield self._stop_sentinel_result()
+            return
+
+        yield event.plain_result(
+            f"[article-summary] 链接校验完成：有效 {len(valid_items)} / 候选 {len(candidates)}，正在生成每周总结..."
+        )
+        summary_task_id = self._next_ephemeral_codex_task_id()
+        summary_error, _ = await self._run_codex(
+            event=event,
+            run_dir=summary_run_dir,
+            resolved_args=summary_args,
+            task_id=summary_task_id,
+            article_id=0,
+            article_url="",
+            prompt_preview=summary_prompt,
+            progress_title=PROGRESS_TITLE_WEEKLY_SUMMARY,
+            include_web_search_in_progress=False,
+        )
+        if summary_error:
+            yield event.plain_result(f"[article-summary] 每周总结失败：生成摘要异常（{summary_error}）。")
+            yield self._stop_sentinel_result()
+            return
+
+        weekly_text = self._extract_weekly_summary_text(summary_run_dir)
+        if not weekly_text:
+            yield event.plain_result("[article-summary] 每周总结失败：未提取到规范输出内容。")
+            yield self._stop_sentinel_result()
+            return
+
+        yield event.plain_result(
+            "[article-summary] 每周总结：\n"
+            f"统计区间：{self._format_ts(since_ts)} ~ {self._format_ts(now_ts)}\n"
+            f"候选 {len(candidates)} 篇，有效 {len(valid_items)} 篇（无效 {invalid_count} 篇）\n\n"
+            f"{weekly_text}"
+        )
         yield self._stop_sentinel_result()
 
     async def set_default_publish_space_command(self, event: AstrMessageEvent, space_name: str = ""):
@@ -1105,7 +1263,8 @@ class ArticleSummaryService(Star):
             "7. /默认发布 <空间> <团队> <知识库>\n"
             "8. /删除文章 <文章ID>\n"
             "9. 知识库账户 <username> <password>（仅私聊，验证成功后保存）\n"
-            "10. /文档总结帮助"
+            "10. /每周总结\n"
+            "11. /文档总结帮助"
         )
 
     def _get_command_args(
@@ -1556,6 +1715,19 @@ class ArticleSummaryService(Star):
         message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = work_root / f"{timestamp}-publish-a{max(0, article_id)}-{message_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    def _create_weekly_summary_run_dir(self, event: AstrMessageEvent, phase: str) -> Path:
+        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
+        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
+        if not work_root.is_absolute():
+            work_root = Path.cwd() / work_root
+
+        message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        phase_segment = self._safe_segment(str(phase or "summary"))
+        run_dir = work_root / f"{timestamp}-weekly-{phase_segment}-{message_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
@@ -2379,6 +2551,301 @@ class ArticleSummaryService(Star):
 
     def _json_code_block(self, payload: dict[str, Any]) -> str:
         return "```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```"
+
+    def _write_json_file(self, path: Path, payload: dict[str, Any]) -> str:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return ""
+        except Exception as exc:
+            logger.warning("[article-summary] write json file failed path=%s err=%s", path, exc)
+            return f"写入 {path.name} 失败：{exc}"
+
+    def _build_weekly_summary_candidates(self, articles: list[dict]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+
+        for article in articles:
+            article_id = int(article.get("id") or 0)
+            if article_id <= 0:
+                continue
+
+            raw_url = str(article.get("source_url") or article.get("normalized_url") or "").strip()
+            url = self._sanitize_url_candidate(raw_url)
+            if not url:
+                continue
+
+            normalized_key = self._normalize_url(url)
+            if normalized_key in seen_urls:
+                continue
+            seen_urls.add(normalized_key)
+
+            title = self._extract_weekly_article_title(article, url)
+            summary_hint = str(article.get("summary_text") or "").strip()
+            if not summary_hint:
+                plain_text = str(article.get("article_plain_text") or "").strip()
+                if plain_text:
+                    summary_hint = plain_text
+                else:
+                    markdown = str(article.get("article_markdown") or "").strip()
+                    if markdown:
+                        summary_hint = self._extract_readable_text(markdown)
+
+            result.append(
+                {
+                    "article_id": article_id,
+                    "title": self._clip_text(title, 120),
+                    "url": url,
+                    "published_at": int(article.get("publish_updated_at") or 0),
+                    "summary_hint": self._clip_text(summary_hint, 260),
+                }
+            )
+        return result
+
+    def _extract_weekly_article_title(self, article: dict[str, Any], url: str) -> str:
+        markdown = str(article.get("article_markdown") or "").strip()
+        if markdown:
+            for raw_line in markdown.splitlines():
+                line = str(raw_line or "").strip()
+                if not line:
+                    continue
+                match = MARKDOWN_HEADING_PATTERN.match(line)
+                if not match:
+                    continue
+                heading = re.sub(r"\s+#*\s*$", "", str(match.group(1) or "")).strip()
+                if heading:
+                    return heading
+
+        summary_text = str(article.get("summary_text") or "").strip()
+        if summary_text:
+            first_line = summary_text.splitlines()[0].strip()
+            if first_line:
+                return first_line
+
+        parsed = urlsplit(url)
+        path_parts = [segment for segment in str(parsed.path or "").split("/") if segment]
+        if path_parts:
+            return path_parts[-1].replace("-", " ").replace("_", " ")
+        if parsed.netloc:
+            return parsed.netloc
+        return f"文章{int(article.get('id') or 0)}"
+
+    def _build_weekly_verify_prompt(self, input_file: Path) -> str:
+        payload = {
+            "input_file": str(input_file),
+            "valid_rule": "最终访问结果必须为 2xx",
+        }
+        return (
+            "你现在需要使用 $post-article-to-xws-knowledgebase 技能，对文章链接做快速有效性判断。\n"
+            "只做链接可访问性校验，不要发布文章，不要创建或修改知识库内容。\n"
+            "请先读取 input_file 指向的 JSON 文件，逐条检查 candidates 里的 url。\n"
+            "有效标准：链接最终访问结果必须是 HTTP 2xx；其余（3xx/4xx/5xx/超时/解析失败）都算无效。\n"
+            f"{PROMPT_SAFETY_REQUIREMENT}\n"
+            "【输入参数(JSON)】\n"
+            f"{self._json_code_block(payload)}\n\n"
+            "【输出要求】任务结束时必须输出一行 JSON（可放在 ```json 代码块中）：\n"
+            '{"valid_article_ids":[1,2],"invalid_article_ids":[3],"notes":"<可选>"}'
+        )
+
+    def _extract_weekly_verify_valid_items(
+        self,
+        verify_run_dir: Path,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int, str]:
+        if not candidates:
+            return [], 0, ""
+
+        candidate_map = {int(item.get("article_id") or 0): item for item in candidates}
+        candidate_map = {key: value for key, value in candidate_map.items() if key > 0}
+        if not candidate_map:
+            return [], 0, "候选数据为空"
+
+        for file_name in ("codex.stdout.log", "codex.stderr.log"):
+            text = self._tail_file_text(verify_run_dir / file_name, 120000)
+            if not text:
+                continue
+            json_candidates = self._collect_weekly_verify_json_candidates(text)
+            for candidate in json_candidates:
+                try:
+                    payload = json.loads(candidate)
+                except Exception:
+                    continue
+                matched, valid_ids = self._parse_weekly_verify_payload(payload, candidate_map)
+                if not matched:
+                    continue
+
+                valid_items = [candidate_map[item_id] for item_id in valid_ids if item_id in candidate_map]
+                valid_item_ids = {int(item.get("article_id") or 0) for item in valid_items}
+                invalid_count = max(0, len(candidate_map) - len(valid_item_ids))
+                return valid_items, invalid_count, ""
+        return [], 0, "未获取到结构化校验结果"
+
+    def _collect_weekly_verify_json_candidates(self, text: str) -> list[str]:
+        candidates: list[str] = []
+        for match in VERIFY_RESULT_CODE_BLOCK_PATTERN.finditer(text):
+            candidate = str(match.group(1) or "").strip()
+            if candidate:
+                candidates.append(candidate)
+
+        lines = text.splitlines()
+        for raw_line in reversed(lines):
+            line = str(raw_line or "").strip().strip("`").strip()
+            if not line:
+                continue
+            if "{" not in line or "}" not in line:
+                continue
+            if (
+                '"valid_article_ids"' not in line
+                and "'valid_article_ids'" not in line
+                and '"valid_ids"' not in line
+                and "'valid_ids'" not in line
+                and '"invalid_article_ids"' not in line
+                and "'invalid_article_ids'" not in line
+                and '"invalid_ids"' not in line
+                and "'invalid_ids'" not in line
+            ):
+                continue
+            start = line.find("{")
+            end = line.rfind("}")
+            if end <= start:
+                continue
+            candidate = line[start : end + 1].strip()
+            if candidate:
+                candidates.append(candidate)
+
+        whole_text = text.strip()
+        if whole_text.startswith("{") and whole_text.endswith("}"):
+            candidates.append(whole_text)
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for candidate in reversed(candidates):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            ordered.append(candidate)
+        return ordered
+
+    def _parse_weekly_verify_payload(
+        self,
+        payload: Any,
+        candidate_map: dict[int, dict[str, Any]],
+    ) -> tuple[bool, list[int]]:
+        if not isinstance(payload, dict):
+            return False, []
+
+        containers = [payload]
+        result_payload = payload.get("result")
+        if isinstance(result_payload, dict):
+            containers.append(result_payload)
+
+        saw_supported_key = False
+        for container in containers:
+            for key in ("valid_article_ids", "valid_ids"):
+                if key not in container:
+                    continue
+                saw_supported_key = True
+                valid_ids, matched = self._parse_weekly_verify_id_list(container.get(key), candidate_map)
+                if matched:
+                    return True, valid_ids
+
+            for key in ("invalid_article_ids", "invalid_ids"):
+                if key not in container:
+                    continue
+                saw_supported_key = True
+                invalid_ids, matched = self._parse_weekly_verify_id_list(container.get(key), candidate_map)
+                if not matched:
+                    continue
+                invalid_set = set(invalid_ids)
+                inferred_valid = [
+                    article_id
+                    for article_id in candidate_map.keys()
+                    if article_id not in invalid_set
+                ]
+                return True, inferred_valid
+        if saw_supported_key:
+            return True, []
+        return False, []
+
+    def _parse_weekly_verify_id_list(
+        self,
+        raw_value: Any,
+        candidate_map: dict[int, dict[str, Any]],
+    ) -> tuple[list[int], bool]:
+        if not isinstance(raw_value, list):
+            return [], False
+        parsed_ids: list[int] = []
+        seen: set[int] = set()
+        for item in raw_value:
+            item_id = self._parse_int(item)
+            if item_id <= 0 or item_id not in candidate_map:
+                continue
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            parsed_ids.append(item_id)
+        return parsed_ids, True
+
+    def _build_weekly_summary_prompt(self, input_file: Path) -> str:
+        payload = {
+            "input_file": str(input_file),
+            "output_template": "[领域]\\n1. 标题：访问链接；",
+        }
+        return (
+            "请读取 input_file 指向的 JSON 文件，并基于 valid_items 生成“每周总结”文本。\n"
+            "你需要按主题聚类后输出多个领域，每个领域下列出对应文章。\n"
+            "每一条文章必须包含标题和访问链接，且链接必须来自输入数据。\n"
+            f"{PROMPT_SAFETY_REQUIREMENT}\n"
+            "【输入参数(JSON)】\n"
+            f"{self._json_code_block(payload)}\n\n"
+            "【输出格式要求】\n"
+            f"1) 仅在 `{WEEKLY_SUMMARY_OUTPUT_BEGIN}` 与 `{WEEKLY_SUMMARY_OUTPUT_END}` 之间输出最终正文。\n"
+            "2) 正文严格使用以下结构（允许多个领域）：\n"
+            "[领域1]\n"
+            "1. 标题1：访问链接；\n\n"
+            "[领域2]\n"
+            "1. 标题2：访问链接；\n"
+            "3) 不要输出额外说明。"
+        )
+
+    def _extract_weekly_summary_text(self, run_dir: Path) -> str:
+        for file_name in ("codex.stdout.log", "codex.stderr.log"):
+            text = self._tail_file_text(run_dir / file_name, 120000)
+            if not text:
+                continue
+            parsed = self._extract_weekly_summary_text_from_log(text)
+            if parsed:
+                return parsed
+        return ""
+
+    def _extract_weekly_summary_text_from_log(self, text: str) -> str:
+        marker_match = WEEKLY_SUMMARY_SECTION_PATTERN.search(text)
+        if marker_match:
+            section = str(marker_match.group(1) or "").strip()
+            if section:
+                return section
+
+        lines = text.splitlines()
+        if not lines:
+            return ""
+
+        start_idx = -1
+        for idx in range(len(lines) - 1, -1, -1):
+            line = str(lines[idx] or "").strip()
+            if line.startswith("[") and line.endswith("]"):
+                start_idx = idx
+                break
+        if start_idx < 0:
+            return ""
+
+        section_lines = [str(line or "").rstrip() for line in lines[start_idx:]]
+        section = "\n".join(section_lines).strip()
+        if "访问链接" not in section:
+            return ""
+        return section
 
     def _validate_prompt_text(
         self,

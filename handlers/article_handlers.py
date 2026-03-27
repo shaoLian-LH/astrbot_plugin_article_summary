@@ -44,6 +44,14 @@ async def handle_article_summary_help_command(
         yield item
 
 
+async def handle_weekly_summary_command(
+    plugin: ArticleSummaryService,
+    event: AstrMessageEvent,
+):
+    async for item in ArticleSummaryService.weekly_summary_command(plugin, event):
+        yield item
+
+
 async def handle_set_default_publish_space_command(
     plugin: ArticleSummaryService,
     event: AstrMessageEvent,

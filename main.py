@@ -16,6 +16,7 @@ if __package__:
         handle_set_default_publish_space_command,
         handle_set_default_publish_team_command,
         handle_set_knowledgebase_account_command,
+        handle_weekly_summary_command,
     )
     from .service.article_summary_service import ArticleSummaryService
     from .utils.constants import PLUGIN_NAME, PLUGIN_VERSION
@@ -33,6 +34,7 @@ else:
         handle_set_default_publish_space_command,
         handle_set_default_publish_team_command,
         handle_set_knowledgebase_account_command,
+        handle_weekly_summary_command,
     )
     from service.article_summary_service import ArticleSummaryService
     from utils.constants import PLUGIN_NAME, PLUGIN_VERSION
@@ -134,6 +136,11 @@ class ArticleSummaryPlugin(ArticleSummaryService):
     @filter.command("文档总结帮助", alias={"/文档总结帮助"})
     async def article_summary_help_command(self, event: AstrMessageEvent):
         async for item in handle_article_summary_help_command(self, event):
+            yield item
+
+    @filter.command("每周总结", alias={"/每周总结"})
+    async def weekly_summary_command(self, event: AstrMessageEvent):
+        async for item in handle_weekly_summary_command(self, event):
             yield item
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=999)

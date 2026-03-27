@@ -732,6 +732,29 @@ class ArticleRepository(SQLiteRepositoryBase):
             statuses=(TASK_STATUS_PROCESSING, TASK_STATUS_STOPPED),
         )
 
+    def list_recent_published_articles(self, since_ts: int, limit: int = 200) -> list[dict]:
+        max_items = max(1, int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
+                       summary_text, article_file_path, owner_platform, owner_account_id,
+                       publish_status, publish_last_error, publish_updated_at,
+                       last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
+                FROM articles
+                WHERE publish_status = ?
+                  AND publish_updated_at >= ?
+                ORDER BY publish_updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (
+                    ARTICLE_PUBLISH_STATUS_PUBLISHED,
+                    max(0, int(since_ts)),
+                    max_items,
+                ),
+            ).fetchall()
+        return [self._to_dict(row) for row in rows]
+
     def get_user_publish_defaults(self, platform: str, account_id: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
