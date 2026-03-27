@@ -333,7 +333,7 @@ class ArticleSummaryService(Star):
             yield self._stop_sentinel_result()
             return
 
-        candidates = self._build_weekly_summary_candidates(articles)
+        candidates = self._build_weekly_summary_candidates(articles, repo=repo)
         if not candidates:
             yield event.plain_result("[article-summary] 近 7 天内没有可用于总结的有效候选文章。")
             yield self._stop_sentinel_result()
@@ -955,8 +955,12 @@ class ArticleSummaryService(Star):
             yield self._stop_sentinel_result()
             return
 
-        repo.set_article_publish_published(target_article_id, last_error="")
         share_url = self._extract_first_publish_url(run_dir)
+        repo.set_article_publish_published_with_share_url(
+            target_article_id,
+            publish_share_url=share_url,
+            last_error="",
+        )
         if share_url:
             logger.info(
                 "[article-summary] publish done article=%s share_url=%s",
@@ -2564,7 +2568,11 @@ class ArticleSummaryService(Star):
             logger.warning("[article-summary] write json file failed path=%s err=%s", path, exc)
             return f"写入 {path.name} 失败：{exc}"
 
-    def _build_weekly_summary_candidates(self, articles: list[dict]) -> list[dict[str, Any]]:
+    def _build_weekly_summary_candidates(
+        self,
+        articles: list[dict],
+        repo: Optional[ArticleRepository] = None,
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
 
@@ -2573,7 +2581,24 @@ class ArticleSummaryService(Star):
             if article_id <= 0:
                 continue
 
-            raw_url = str(article.get("source_url") or article.get("normalized_url") or "").strip()
+            raw_url = str(article.get("publish_share_url") or "").strip()
+            if not raw_url:
+                run_dir = self._resolve_run_dir(str(article.get("last_run_dir") or ""))
+                if run_dir and run_dir.is_dir():
+                    extracted = self._extract_first_publish_url(run_dir)
+                    if extracted:
+                        raw_url = extracted
+                        if repo is not None:
+                            try:
+                                repo.set_article_publish_share_url(article_id, extracted)
+                            except Exception as exc:
+                                logger.warning(
+                                    "[article-summary] persist publish_share_url failed article=%s err=%s",
+                                    article_id,
+                                    exc,
+                                )
+            if not raw_url:
+                continue
             url = self._sanitize_url_candidate(raw_url)
             if not url:
                 continue
