@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+- 发布流程新增 `article.md` 预处理：发布前自动移除文件开头 `--- ... ---` 包裹的首段 YAML meta（front matter），并覆盖原缓存文件后再执行发布。
+
+### Changed
+- front matter 识别增强：兼容 BOM、CRLF 与 EOF 结尾场景；抽取可读文本路径复用同一清理逻辑。
+
 ## v0.0.17 - 2026-03-26
 
 ### Added

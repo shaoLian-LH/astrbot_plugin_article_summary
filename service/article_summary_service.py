@@ -48,7 +48,7 @@ except Exception:
     AstrBotConfig = dict  # type: ignore[misc,assignment]
 
 URL_PATTERN = re.compile(r"https?://[^\s<>'\"\)\]]+")
-FRONTMATTER_PATTERN = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
+FRONTMATTER_PATTERN = re.compile(r"^\ufeff?---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)")
 CODE_BLOCK_PATTERN = re.compile(r"```.*?```", re.DOTALL)
 INLINE_CODE_PATTERN = re.compile(r"`[^`]*`")
 MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^\)]+\)")
@@ -741,6 +741,12 @@ class ArticleSummaryService(Star):
             target_article_id,
             run_dir,
         )
+        sanitize_error = self._strip_frontmatter_for_publish(article_file)
+        if sanitize_error:
+            repo.set_article_publish_failed(target_article_id, sanitize_error)
+            yield event.plain_result(f"[article-summary] 发布失败：{sanitize_error}")
+            yield self._stop_sentinel_result()
+            return
         self._prepare_codex_workspace_config(run_dir)
 
         defaults_prompt_block = self._build_publish_prompt_defaults_block(auto_publish_defaults)
@@ -3379,9 +3385,39 @@ class ArticleSummaryService(Star):
             return None
         return max(candidates, key=lambda item: item.stat().st_mtime)
 
+    def _strip_frontmatter_for_publish(self, article_file: Path) -> str:
+        try:
+            markdown = article_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "[article-summary] read article.md failed before publish path=%s err=%s",
+                article_file,
+                exc,
+            )
+            return f"读取 article.md 失败：{exc}"
+
+        stripped_markdown, changed = self._strip_leading_frontmatter(markdown)
+        if not changed:
+            return ""
+
+        try:
+            article_file.write_text(stripped_markdown, encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "[article-summary] write article.md failed before publish path=%s err=%s",
+                article_file,
+                exc,
+            )
+            return f"写入 article.md 失败：{exc}"
+        return ""
+
+    def _strip_leading_frontmatter(self, markdown: str) -> tuple[str, bool]:
+        stripped = FRONTMATTER_PATTERN.sub("", markdown, count=1)
+        return stripped, stripped != markdown
+
     def _extract_readable_text(self, markdown: str) -> str:
         text = markdown.strip()
-        text = FRONTMATTER_PATTERN.sub("", text)
+        text, _ = self._strip_leading_frontmatter(text)
         text = CODE_BLOCK_PATTERN.sub(" ", text)
         text = INLINE_CODE_PATTERN.sub(" ", text)
         text = MARKDOWN_IMAGE_PATTERN.sub(" ", text)
