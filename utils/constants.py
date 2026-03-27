@@ -1,2 +1,2 @@
-PLUGIN_VERSION = "0.0.17"
+PLUGIN_VERSION = "0.0.18"
 PLUGIN_NAME = "astrbot_plugin_article_summary"

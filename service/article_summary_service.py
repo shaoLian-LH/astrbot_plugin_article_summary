@@ -919,20 +919,27 @@ class ArticleSummaryService(Star):
         )
         if auto_publish_action is not None:
             event.stop_event()
-            auto_error = str(auto_publish_action.get("error") or "").strip()
-            if auto_error:
-                yield event.plain_result(auto_error)
+            try:
+                await self._add_recognition_reaction(event)
+                auto_error = str(auto_publish_action.get("error") or "").strip()
+                if auto_error:
+                    yield event.plain_result(auto_error)
+                    yield self._stop_sentinel_result()
+                    return
+                async for item in ArticleSummaryService.publish_article_command(
+                    self,
+                    event,
+                    str(auto_publish_action.get("article_id") or ""),
+                    str(auto_publish_action.get("space") or ""),
+                    str(auto_publish_action.get("team") or ""),
+                    str(auto_publish_action.get("knowledge_base") or ""),
+                    auto_publish_defaults=auto_publish_action.get("prompt_defaults") or {},
+                ):
+                    yield item
+            except Exception as exc:
+                logger.exception("[article-summary] auto_publish failed id=%s err=%s", message_id or "-", exc)
+                yield event.plain_result("[article-summary] 自动发布失败，请稍后重试。")
                 yield self._stop_sentinel_result()
-                return
-            async for item in self.publish_article_command(
-                event,
-                str(auto_publish_action.get("article_id") or ""),
-                str(auto_publish_action.get("space") or ""),
-                str(auto_publish_action.get("team") or ""),
-                str(auto_publish_action.get("knowledge_base") or ""),
-                auto_publish_defaults=auto_publish_action.get("prompt_defaults") or {},
-            ):
-                yield item
             return
 
         bot_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
