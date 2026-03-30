@@ -43,6 +43,11 @@
     "description": "Codex 执行超时时间（秒）",
     "default": 900
   },
+  "publish_resume_token_ttl_seconds": {
+    "type": "int",
+    "description": "发布失败回执 token 有效期（秒，最小 60）",
+    "default": 900
+  },
   "default_codex_model": {
     "type": "string",
     "description": "默认 Codex 模型（当工作空间 .codex/config.toml 未提供 model 时生效）",
@@ -100,7 +105,13 @@
     "description": "发布文章时传给 Codex 的提示词模板，支持 {article_path}、{space}、{team}、{knowledge_base}",
     "editor_mode": true,
     "editor_language": "markdown",
-    "default": "你现在需要使用 $post-article-to-xws-knowledgebase 的能力将 {article_path} 内容发布到 {space} 空间 {team} 团队下的 {knowledge_base} 知识库中，并且要注意优先处理图片上传和文章内图片链接替换的逻辑"
+    "default": "你现在需要使用 $post-article-to-xws-knowledgebase 的能力将 {article_path} 内容发布到 {space} 空间 {team} 团队下的 {knowledge_base} 知识库中，并且要注意优先处理图片上传和文章内图片链接替换的逻辑；当图片上传失败时必须至少重试两次；发布成功后必须返回知识库分享链接。"
+  },
+  "publish_trusted_domains": {
+    "type": "string",
+    "description": "发布分享链接可信域名白名单（逗号/空格分隔，命中即判为知识库链接；业务域名不含 xws 时建议必配）",
+    "hint": "示例：kb.example.com, docs.example.com",
+    "default": ""
   },
   "max_plain_chars": {
     "type": "int",
