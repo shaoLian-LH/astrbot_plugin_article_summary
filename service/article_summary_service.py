@@ -48,6 +48,7 @@ except Exception:
     AstrBotConfig = dict  # type: ignore[misc,assignment]
 
 URL_PATTERN = re.compile(r"https?://[^\s<>'\"\)\]]+")
+PURE_TEXT_URL_PATTERN = re.compile(r"^\s*(https?://[^\s<>'\"\)\]]+)\s*$")
 FRONTMATTER_PATTERN = re.compile(r"^\ufeff?---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)")
 CODE_BLOCK_PATTERN = re.compile(r"```.*?```", re.DOTALL)
 INLINE_CODE_PATTERN = re.compile(r"`[^`]*`")
@@ -1123,11 +1124,9 @@ class ArticleSummaryService(Star):
             )
             return
 
-        href = self._extract_first_url(reply_payload)
-        if not href:
-            href = self._extract_reply_preview_url(event)
+        href = self._extract_reply_pure_text_link(reply_payload)
         if not href and fetched_reply_payload is not None:
-            href = self._extract_first_url(fetched_reply_payload)
+            href = self._extract_reply_pure_text_link(fetched_reply_payload)
 
         if not href:
             if reply_id and fetched_reply_payload is None:
@@ -1138,18 +1137,21 @@ class ArticleSummaryService(Star):
                 )
                 fetched_reply_payload = await self._fetch_reply_payload_by_id(event, reply_id)
                 if fetched_reply_payload is not None:
-                    href = self._extract_first_url(fetched_reply_payload)
+                    href = self._extract_reply_pure_text_link(fetched_reply_payload)
                     logger.info(
-                        "[article-summary] get_msg_result id=%s reply_id=%s url_found=%s payload_preview=%s",
+                        "[article-summary] get_msg_result id=%s reply_id=%s pure_text_link_found=%s payload_preview=%s",
                         message_id or "-",
                         reply_id,
                         bool(href),
                         self._preview_any(fetched_reply_payload),
                     )
 
+        if not href and not reply_id:
+            href = self._extract_reply_preview_pure_text_link(event)
+
         if not href:
             logger.info(
-                "[article-summary] skip id=%s reason=reply_without_url reply_preview=%s",
+                "[article-summary] skip id=%s reason=reply_not_pure_text_link reply_preview=%s",
                 message_id or "-",
                 self._preview_any(reply_payload),
             )
@@ -3061,33 +3063,126 @@ class ArticleSummaryService(Star):
         data = getattr(segment, "data", None)
         return data if data is not None else segment
 
-    def _extract_first_url(self, payload: Any) -> str:
-        for text in self._iter_text_values(payload):
-            match = URL_PATTERN.search(text)
-            if not match:
-                continue
-            url = match.group(0).rstrip(".,;!?\")'")
-            return url
+    def _extract_pure_text_url(self, value: Any) -> str:
+        if value is None:
+            return ""
+
+        text = str(value)
+        match = PURE_TEXT_URL_PATTERN.match(text)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip()
+
+    def _extract_reply_message_segments(self, payload: Any, depth: int = 0) -> Optional[list[Any]]:
+        if depth > 5 or payload is None:
+            return None
+
+        if isinstance(payload, dict):
+            message = payload.get("message")
+            if isinstance(message, list):
+                return message
+            nested = payload.get("data")
+            if nested is not None:
+                return self._extract_reply_message_segments(nested, depth + 1)
+            return None
+
+        message = getattr(payload, "message", None)
+        if isinstance(message, list):
+            return message
+
+        nested = getattr(payload, "data", None)
+        if nested is not None:
+            return self._extract_reply_message_segments(nested, depth + 1)
+        return None
+
+    def _extract_text_segment_value(self, segment: Any) -> str:
+        if isinstance(segment, str):
+            return segment
+
+        data = self._segment_data(segment)
+        if isinstance(data, dict):
+            value = data.get("text")
+            if value is None:
+                value = data.get("content")
+            if value is None and isinstance(segment, dict):
+                value = segment.get("text")
+            return str(value or "")
+
+        if isinstance(data, str):
+            return data
+
+        value = getattr(data, "text", None)
+        if value is None:
+            value = getattr(data, "content", None)
+        if value is not None:
+            return str(value)
         return ""
 
-    def _extract_reply_preview_url(self, event: AstrMessageEvent) -> str:
+    def _extract_reply_text_candidate(self, payload: Any, depth: int = 0) -> str:
+        if depth > 5 or payload is None:
+            return ""
+
+        if isinstance(payload, str):
+            return payload
+
+        if isinstance(payload, dict):
+            for key in ("message_str", "text", "content", "message", "raw_message"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            nested = payload.get("data")
+            if nested is not None:
+                return self._extract_reply_text_candidate(nested, depth + 1)
+            return ""
+
+        for attr in ("message_str", "text", "content", "message", "raw_message"):
+            value = getattr(payload, attr, None)
+            if isinstance(value, str) and value:
+                return value
+
+        nested = getattr(payload, "data", None)
+        if nested is not None:
+            return self._extract_reply_text_candidate(nested, depth + 1)
+        return ""
+
+    def _extract_reply_pure_text_link(self, payload: Any) -> str:
+        segments = self._extract_reply_message_segments(payload)
+        if isinstance(segments, list):
+            text_parts: list[str] = []
+            for segment in segments:
+                segment_type = self._segment_type(segment)
+                if segment_type == "reply":
+                    continue
+                if segment_type and segment_type != "text":
+                    return ""
+
+                text_value = self._extract_text_segment_value(segment)
+                if text_value:
+                    text_parts.append(text_value)
+                    continue
+
+                if isinstance(segment, str):
+                    text_parts.append(segment)
+                    continue
+
+                if segment_type == "text":
+                    continue
+                return ""
+
+            return self._extract_pure_text_url("".join(text_parts))
+
+        text_candidate = self._extract_reply_text_candidate(payload)
+        return self._extract_pure_text_url(text_candidate)
+
+    def _extract_reply_preview_pure_text_link(self, event: AstrMessageEvent) -> str:
         for component in self._safe_get_messages(event):
             if component.__class__.__name__.lower() != "reply":
                 continue
-            for attr in ("message_str", "text", "content", "raw_message"):
+            for attr in ("message_str", "text", "content"):
                 value = getattr(component, attr, None)
-                if not value:
-                    continue
-                match = URL_PATTERN.search(str(value))
-                if match:
-                    return match.group(0).rstrip(".,;!?\")'")
-
-        outline = self._safe_call(event, "get_message_outline")
-        if outline:
-            match = URL_PATTERN.search(outline)
-            if match:
-                return match.group(0).rstrip(".,;!?\")'")
-
+                href = self._extract_pure_text_url(value)
+                if href:
+                    return href
         return ""
 
     def _extract_reply_id(self, payload: Any) -> str:
