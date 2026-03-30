@@ -130,11 +130,23 @@ PROMPT_SAFETY_REQUIREMENT = (
 PUBLISH_GUIDE_HEADER_TEXT = "[article-summary]"
 PUBLISH_GUIDE_TRIGGER_TEXT = "文章解析成功，可使用以下命令发布"
 PUBLISH_GUIDE_ARTICLE_ID_PATTERN = re.compile(r"发布文章\s+(\d+)")
+INTERRUPT_NOTICE_TEXT = "[article-summary] 获取任务已被打断，可直接回复本消息（或回复“继续”）自动继续获取。"
+INTERRUPT_NOTICE_TAG = "[AS-INTERRUPT]"
+INTERRUPT_NOTICE_TASK_IDS_PATTERN = re.compile(r"\btasks\s*=\s*([0-9,\s]+)", re.IGNORECASE)
+INTERRUPT_NOTICE_BATCH_WINDOW_SECONDS = 2
 AUTO_PUBLISH_AT_SEGMENT_PATTERN = re.compile(
     r"(?:\[CQ:at,[^\]]+\]|\[at:[^\]]+\]|<@!?[^>]+>|<at[^>]*>)",
     re.IGNORECASE,
 )
+AUTO_REPLY_SEGMENT_PATTERN = re.compile(
+    r"(?:\[CQ:reply,[^\]]+\]|\[reply:[^\]]+\]|<reply[^>]*>)",
+    re.IGNORECASE,
+)
 AUTO_PUBLISH_LEADING_AT_PATTERN = re.compile(r"^\s*[@＠](?:[^\s]+|\s+[^\s]+)\s*")
+AUTO_RESUME_REPLY_PATTERN = re.compile(
+    r"^/?(?:\S+\s+)?(?:继续|继续获取|继续获取文章|resume)(?:\s|$)",
+    re.IGNORECASE,
+)
 
 
 class ArticleSummaryService(Star):
@@ -145,6 +157,9 @@ class ArticleSummaryService(Star):
         self._active_codex_tasks: dict[int, dict[str, Any]] = {}
         self._active_codex_lock = asyncio.Lock()
         self._ephemeral_codex_task_id = 0
+        self._interrupt_notice_lock = asyncio.Lock()
+        self._group_interrupt_batches: dict[str, dict[str, Any]] = {}
+        self._interrupt_batch_seq = 0
 
     async def initialize(self):
         repo = self._ensure_repository()
@@ -241,44 +256,73 @@ class ArticleSummaryService(Star):
             yield self._stop_sentinel_result()
             return
 
+        async for item in self._resume_task_by_owner(
+            event=event,
+            task_id=task_id,
+            platform=platform,
+            account_id=account_id,
+            auto_mode=False,
+        ):
+            yield item
+        yield self._stop_sentinel_result()
+
+    async def _resume_task_by_owner(
+        self,
+        event: AstrMessageEvent,
+        task_id: int,
+        platform: str,
+        account_id: str,
+        auto_mode: bool = False,
+    ):
         repo = self._ensure_repository()
         task = repo.get_task_by_id_for_owner(task_id, platform, account_id)
         if task is None:
-            yield event.plain_result("[article-summary] 未找到该列表项，或你没有权限操作它。")
-            yield self._stop_sentinel_result()
+            if not auto_mode:
+                yield event.plain_result("[article-summary] 未找到该列表项，或你没有权限操作它。")
             return
 
         task_status = str(task.get("status") or "")
         if task_status == TASK_STATUS_COMPLETED:
+            if auto_mode:
+                return
             article = repo.get_article_by_id(int(task.get("article_id") or 0))
             if article and str(article.get("status") or "") == ARTICLE_STATUS_COMPLETED:
-                async for item in self._emit_cached_article_result(event, article):
+                async for item in self._emit_cached_article_result(
+                    event,
+                    article,
+                    emit_stop_sentinel=False,
+                ):
                     yield item
                 return
-            yield event.plain_result("[article-summary] 该列表项已完成。")
-            yield self._stop_sentinel_result()
+            if not auto_mode:
+                yield event.plain_result("[article-summary] 该列表项已完成。")
             return
         if task_status == TASK_STATUS_PROCESSING:
-            yield event.plain_result("[article-summary] 该列表项正在处理中，请稍候。")
-            yield self._stop_sentinel_result()
+            if not auto_mode:
+                yield event.plain_result("[article-summary] 该列表项正在处理中，请稍候。")
             return
         if task_status != TASK_STATUS_STOPPED:
-            yield event.plain_result(f"[article-summary] 当前状态不支持继续：{task_status or '-'}")
-            yield self._stop_sentinel_result()
+            if not auto_mode:
+                yield event.plain_result(f"[article-summary] 当前状态不支持继续：{task_status or '-'}")
             return
 
         article_id = int(task.get("article_id") or 0)
         article = repo.get_article_by_id(article_id)
         if article and str(article.get("status") or "") == ARTICLE_STATUS_COMPLETED:
             repo.complete_tasks_for_article(article_id)
-            async for item in self._emit_cached_article_result(event, article):
-                yield item
+            if not auto_mode:
+                async for item in self._emit_cached_article_result(
+                    event,
+                    article,
+                    emit_stop_sentinel=False,
+                ):
+                    yield item
             return
 
         session_id = str(task.get("session_id") or task.get("last_session_id") or "").strip()
         if not session_id:
-            yield event.plain_result("[article-summary] 该任务没有可恢复的 session_id，无法继续。")
-            yield self._stop_sentinel_result()
+            if not auto_mode:
+                yield event.plain_result("[article-summary] 该任务没有可恢复的 session_id，无法继续。")
             return
 
         run_dir = self._resolve_run_dir(str(task.get("run_dir") or ""))
@@ -289,8 +333,8 @@ class ArticleSummaryService(Star):
 
         resume_args, resume_error = self._build_resume_codex_args(session_id)
         if resume_error:
-            yield event.plain_result(f"[article-summary] 无法构建继续命令: {resume_error}")
-            yield self._stop_sentinel_result()
+            if not auto_mode:
+                yield event.plain_result(f"[article-summary] 无法构建继续命令: {resume_error}")
             return
 
         repo.update_task_status(
@@ -311,6 +355,7 @@ class ArticleSummaryService(Star):
             run_dir=run_dir,
             codex_args=resume_args,
             prompt_preview=f"resume {session_id}",
+            emit_stop_sentinel=False,
         ):
             yield item
 
@@ -1105,6 +1150,63 @@ class ArticleSummaryService(Star):
                 yield self._stop_sentinel_result()
             return
 
+        auto_resume_action, _ = await self._resolve_auto_resume_reply_action(
+            event=event,
+            message_id=message_id,
+            reply_payload=reply_payload,
+            reply_id=reply_id,
+        )
+        if auto_resume_action is not None:
+            event.stop_event()
+            try:
+                await self._add_recognition_reaction(event)
+                auto_error = str(auto_resume_action.get("error") or "").strip()
+                if auto_error:
+                    yield event.plain_result(auto_error)
+                    yield self._stop_sentinel_result()
+                    return
+
+                task_ids: list[int] = []
+                for raw_task_id in (auto_resume_action.get("task_ids") or []):
+                    task_id = self._parse_int(raw_task_id)
+                    if task_id > 0:
+                        task_ids.append(task_id)
+                if not task_ids:
+                    yield event.plain_result("[article-summary] 该中断提示中没有你可继续的任务。")
+                    yield self._stop_sentinel_result()
+                    return
+
+                platform = str(auto_resume_action.get("platform") or "").strip()
+                account_id = str(auto_resume_action.get("account_id") or "").strip()
+                if not platform or not account_id:
+                    platform, account_id = self._resolve_user_scope(event)
+
+                yield event.plain_result(
+                    f"[article-summary] 已识别 {len(task_ids)} 个可继续任务，正在自动继续获取。"
+                )
+
+                for task_id in task_ids:
+                    async for item in self._resume_task_by_owner(
+                        event=event,
+                        task_id=task_id,
+                        platform=platform,
+                        account_id=account_id,
+                        auto_mode=True,
+                    ):
+                        yield item
+
+                skipped_count = max(0, int(auto_resume_action.get("skipped_count") or 0))
+                if skipped_count > 0:
+                    yield event.plain_result(
+                        f"[article-summary] 已忽略 {skipped_count} 个无权限或不可继续任务。"
+                    )
+                yield self._stop_sentinel_result()
+            except Exception as exc:
+                logger.exception("[article-summary] auto_resume failed id=%s err=%s", message_id or "-", exc)
+                yield event.plain_result("[article-summary] 自动继续失败，请稍后重试。")
+                yield self._stop_sentinel_result()
+            return
+
         bot_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
         at_targets = self._collect_at_targets(event)
         if not self._is_at_bot(event):
@@ -1261,7 +1363,7 @@ class ArticleSummaryService(Star):
         return (
             "[article-summary] 可用命令：\n"
             "1. /获取文章列表\n"
-            "2. /继续获取文章 <列表项id>\n"
+            "2. /继续获取文章 <列表项id>（也可回复中断提示消息或“继续”自动继续）\n"
             "3. /发布文章 <文章ID> [空间] [团队] [知识库名称]（缺省按空间->团队->知识库顺序生效）\n"
             "4. /默认发布空间 <空间名或代号>\n"
             "5. /默认发布团队 <团队名或代号>\n"
@@ -1477,6 +1579,138 @@ class ArticleSummaryService(Star):
             fetched_reply_payload,
         )
 
+    def _extract_interrupt_notice_task_ids(self, payload: Any) -> list[int]:
+        text_values = [str(item or "").strip() for item in self._iter_text_values(payload)]
+        text_values = [item for item in text_values if item]
+        if not text_values:
+            return []
+
+        joined = "\n".join(text_values)
+        if INTERRUPT_NOTICE_TAG not in joined:
+            return []
+
+        match = INTERRUPT_NOTICE_TASK_IDS_PATTERN.search(joined)
+        if not match:
+            return []
+
+        parsed_ids: list[int] = []
+        seen: set[int] = set()
+        for part in str(match.group(1) or "").split(","):
+            task_id = self._parse_int(part)
+            if task_id <= 0 or task_id in seen:
+                continue
+            seen.add(task_id)
+            parsed_ids.append(task_id)
+        return parsed_ids
+
+    async def _resolve_reply_interrupt_notice_context(
+        self,
+        event: AstrMessageEvent,
+        reply_payload: Optional[Any],
+        reply_id: str,
+    ) -> tuple[list[int], Optional[Any]]:
+        if reply_payload is None:
+            return [], None
+
+        task_ids = self._extract_interrupt_notice_task_ids(reply_payload)
+        if task_ids or not reply_id:
+            return task_ids, None
+
+        fetched_reply_payload = await self._fetch_reply_payload_by_id(event, reply_id)
+        if fetched_reply_payload is None:
+            return [], None
+
+        task_ids = self._extract_interrupt_notice_task_ids(fetched_reply_payload)
+        return task_ids, fetched_reply_payload
+
+    def _looks_like_auto_resume_trigger_text(self, text: str) -> bool:
+        normalized = self._normalize_auto_publish_reply_text(text)
+        if not normalized:
+            return True
+        return bool(AUTO_RESUME_REPLY_PATTERN.match(normalized))
+
+    async def _resolve_auto_resume_reply_action(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+        reply_payload: Optional[Any],
+        reply_id: str,
+    ) -> tuple[Optional[dict[str, Any]], Optional[Any]]:
+        task_ids, fetched_reply_payload = await self._resolve_reply_interrupt_notice_context(
+            event=event,
+            reply_payload=reply_payload,
+            reply_id=reply_id,
+        )
+        if not task_ids:
+            return None, fetched_reply_payload
+
+        reply_text = self._extract_reply_user_text(event)
+        if not self._looks_like_auto_resume_trigger_text(reply_text):
+            logger.info(
+                "[article-summary] skip auto_resume id=%s reason=reply_text_not_trigger text=%s",
+                message_id or "-",
+                self._preview_text(reply_text),
+            )
+            return None, fetched_reply_payload
+
+        platform, account_id = self._resolve_user_scope(event)
+        if not account_id:
+            return (
+                {
+                    "error": "[article-summary] 无法识别当前用户。",
+                },
+                fetched_reply_payload,
+            )
+
+        repo = self._ensure_repository()
+        owner_tasks = repo.list_tasks_by_ids_for_owner(task_ids, platform, account_id)
+        owner_task_map = {int(item.get("id") or 0): item for item in owner_tasks}
+
+        resumable_task_ids: list[int] = []
+        skipped_count = 0
+        for task_id in task_ids:
+            task = owner_task_map.get(task_id)
+            if not isinstance(task, dict):
+                skipped_count += 1
+                continue
+
+            status = str(task.get("status") or "").strip()
+            session_id = str(task.get("session_id") or task.get("last_session_id") or "").strip()
+            if status != TASK_STATUS_STOPPED or not session_id:
+                skipped_count += 1
+                continue
+            resumable_task_ids.append(task_id)
+
+        if not resumable_task_ids:
+            logger.info(
+                "[article-summary] auto_resume none id=%s task_ids=%s skipped=%s",
+                message_id or "-",
+                task_ids,
+                skipped_count,
+            )
+            return (
+                {
+                    "error": "[article-summary] 该中断提示中没有你可继续的任务。",
+                },
+                fetched_reply_payload,
+            )
+
+        logger.info(
+            "[article-summary] auto_resume matched id=%s tasks=%s skipped=%s",
+            message_id or "-",
+            resumable_task_ids,
+            skipped_count,
+        )
+        return (
+            {
+                "task_ids": resumable_task_ids,
+                "skipped_count": skipped_count,
+                "platform": platform,
+                "account_id": account_id,
+            },
+            fetched_reply_payload,
+        )
+
     def _extract_reply_user_text(self, event: AstrMessageEvent) -> str:
         parts: list[str] = []
         for component in self._safe_get_messages(event):
@@ -1524,6 +1758,7 @@ class ArticleSummaryService(Star):
             return ""
 
         normalized = AUTO_PUBLISH_AT_SEGMENT_PATTERN.sub(" ", normalized)
+        normalized = AUTO_REPLY_SEGMENT_PATTERN.sub(" ", normalized)
         normalized = MULTI_SPACE_PATTERN.sub(" ", normalized).strip()
         while True:
             updated = AUTO_PUBLISH_LEADING_AT_PATTERN.sub("", normalized, count=1).strip()
@@ -1683,13 +1918,19 @@ class ArticleSummaryService(Star):
             f"- {set_all_cmd}"
         )
 
-    async def _emit_publish_guide_result(self, event: AstrMessageEvent, article_id: int):
+    async def _emit_publish_guide_result(
+        self,
+        event: AstrMessageEvent,
+        article_id: int,
+        emit_stop_sentinel: bool = True,
+    ):
         if article_id <= 0:
             return
         event.stop_event()
         yield event.plain_result(self._build_publish_guide_text(event, article_id))
-        yield self._stop_sentinel_result()
-        event.stop_event()
+        if emit_stop_sentinel:
+            yield self._stop_sentinel_result()
+            event.stop_event()
 
     def _resolve_run_dir(self, run_dir: str) -> Optional[Path]:
         text = str(run_dir or "").strip()
@@ -2263,6 +2504,7 @@ class ArticleSummaryService(Star):
         run_dir: Path,
         codex_args: list[str],
         prompt_preview: str,
+        emit_stop_sentinel: bool = True,
     ):
         codex_error, session_id = await self._run_codex(
             event=event,
@@ -2275,19 +2517,22 @@ class ArticleSummaryService(Star):
         )
         if codex_error:
             self._mark_task_stopped(task_id, article_id, codex_error, session_id)
-            yield event.plain_result(
-                f"[article-summary] 处理失败: {codex_error}\n"
-                f"可执行 /继续获取文章 {task_id} 继续。"
+            await self._emit_task_interrupted_notice(
+                event=event,
+                task_id=task_id,
+                reason=self._classify_interrupt_reason(codex_error),
             )
-            yield self._stop_sentinel_result()
+            if emit_stop_sentinel:
+                yield self._stop_sentinel_result()
             return
 
         article_path = self._find_latest_article(run_dir)
         if article_path is None:
             error_text = "未找到 article.md，请检查 Codex 输出。"
             self._mark_task_stopped(task_id, article_id, error_text, session_id)
-            yield event.plain_result(f"[article-summary] {error_text}")
-            yield self._stop_sentinel_result()
+            await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
+            if emit_stop_sentinel:
+                yield self._stop_sentinel_result()
             return
 
         try:
@@ -2296,8 +2541,9 @@ class ArticleSummaryService(Star):
             error_text = f"读取 article.md 失败: {exc}"
             logger.exception("failed to read article.md: %s", exc)
             self._mark_task_stopped(task_id, article_id, error_text, session_id)
-            yield event.plain_result(f"[article-summary] {error_text}")
-            yield self._stop_sentinel_result()
+            await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
+            if emit_stop_sentinel:
+                yield self._stop_sentinel_result()
             return
 
         article_text = self._extract_readable_text(article_markdown)
@@ -2346,7 +2592,11 @@ class ArticleSummaryService(Star):
             article_id,
             source_url,
         )
-        async for item in self._emit_publish_guide_result(event, article_id):
+        async for item in self._emit_publish_guide_result(
+            event,
+            article_id,
+            emit_stop_sentinel=emit_stop_sentinel,
+        ):
             yield item
 
     def _mark_task_stopped(self, task_id: int, article_id: int, error_text: str, session_id: str) -> None:
@@ -2361,7 +2611,173 @@ class ArticleSummaryService(Star):
         repo.stop_tasks_for_article(article_id, error_text, session_id=session_id)
         repo.set_article_stopped(article_id, error_text, session_id=session_id)
 
-    async def _emit_cached_article_result(self, event: AstrMessageEvent, article: dict):
+    def _classify_interrupt_reason(self, error_text: str) -> str:
+        text = str(error_text or "").lower()
+        if "超时" in text or "timeout" in text:
+            return "timeout"
+        return "unexpected"
+
+    def _build_interrupt_notice_group_scope(self, event: AstrMessageEvent) -> str:
+        platform = self._safe_platform_name(event) or "unknown"
+        group_id = self._safe_call(event, "get_group_id").strip()
+        if group_id:
+            return f"{platform}:{group_id}"
+        return "-"
+
+    def _next_interrupt_batch_id(self) -> str:
+        self._interrupt_batch_seq += 1
+        return f"{int(datetime.now().timestamp())}-{self._interrupt_batch_seq}"
+
+    def _resolve_interrupt_reason_value(self, reasons: set[str]) -> str:
+        normalized = {str(item or "").strip().lower() for item in reasons if str(item or "").strip()}
+        if not normalized:
+            return "unexpected"
+        if len(normalized) == 1:
+            return normalized.pop()
+        return "mixed"
+
+    def _build_interrupt_notice_text(
+        self,
+        event: AstrMessageEvent,
+        task_ids: list[int],
+        reason: str,
+        batch_id: str,
+    ) -> str:
+        normalized_ids: list[str] = []
+        seen: set[int] = set()
+        for raw_task_id in task_ids:
+            try:
+                task_id = int(raw_task_id)
+            except Exception:
+                continue
+            if task_id <= 0 or task_id in seen:
+                continue
+            seen.add(task_id)
+            normalized_ids.append(str(task_id))
+        tasks_value = ",".join(normalized_ids)
+        group_value = self._build_interrupt_notice_group_scope(event)
+        reason_value = str(reason or "").strip() or "unexpected"
+        return (
+            f"{INTERRUPT_NOTICE_TEXT}\n"
+            f"{INTERRUPT_NOTICE_TAG} group={group_value} batch={batch_id} "
+            f"tasks={tasks_value} reason={reason_value}"
+        )
+
+    async def _emit_task_interrupted_notice(
+        self,
+        event: AstrMessageEvent,
+        task_id: int,
+        reason: str,
+    ) -> None:
+        if task_id <= 0:
+            return
+        if self._is_group_message_context(event):
+            await self._queue_group_interrupt_notice(event=event, task_id=task_id, reason=reason)
+            return
+        batch_id = self._next_interrupt_batch_id()
+        text = self._build_interrupt_notice_text(
+            event=event,
+            task_ids=[task_id],
+            reason=self._resolve_interrupt_reason_value({reason}),
+            batch_id=batch_id,
+        )
+        await self._send_plain_message(event, text, purpose="interrupt_notice")
+
+    async def _queue_group_interrupt_notice(
+        self,
+        event: AstrMessageEvent,
+        task_id: int,
+        reason: str,
+    ) -> None:
+        group_scope = self._build_interrupt_notice_group_scope(event)
+        if not group_scope or group_scope == "-":
+            batch_id = self._next_interrupt_batch_id()
+            text = self._build_interrupt_notice_text(
+                event=event,
+                task_ids=[task_id],
+                reason=self._resolve_interrupt_reason_value({reason}),
+                batch_id=batch_id,
+            )
+            await self._send_plain_message(event, text, purpose="interrupt_notice")
+            return
+
+        should_schedule = False
+        delay_seconds = max(0, INTERRUPT_NOTICE_BATCH_WINDOW_SECONDS)
+        async with self._interrupt_notice_lock:
+            batch = self._group_interrupt_batches.get(group_scope)
+            if batch is None:
+                batch = {
+                    "event": event,
+                    "task_ids": [],
+                    "task_id_set": set(),
+                    "reasons": set(),
+                    "batch_id": self._next_interrupt_batch_id(),
+                }
+                self._group_interrupt_batches[group_scope] = batch
+                should_schedule = True
+
+            task_id_set = batch.get("task_id_set")
+            if isinstance(task_id_set, set) and task_id not in task_id_set:
+                task_id_set.add(task_id)
+                task_list = batch.get("task_ids")
+                if isinstance(task_list, list):
+                    task_list.append(task_id)
+
+            reasons = batch.get("reasons")
+            if isinstance(reasons, set):
+                reasons.add(str(reason or "").strip().lower() or "unexpected")
+
+        if should_schedule:
+            asyncio.create_task(
+                self._flush_group_interrupt_notice(group_scope, delay_seconds),
+            )
+
+    async def _flush_group_interrupt_notice(self, group_scope: str, delay_seconds: int) -> None:
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
+        async with self._interrupt_notice_lock:
+            batch = self._group_interrupt_batches.pop(group_scope, None)
+
+        if not isinstance(batch, dict):
+            return
+        event = batch.get("event")
+        if event is None:
+            return
+
+        task_ids: list[int] = []
+        task_ids_raw = batch.get("task_ids")
+        if isinstance(task_ids_raw, list):
+            seen: set[int] = set()
+            for item in task_ids_raw:
+                try:
+                    task_id = int(item)
+                except Exception:
+                    continue
+                if task_id <= 0 or task_id in seen:
+                    continue
+                seen.add(task_id)
+                task_ids.append(task_id)
+        if not task_ids:
+            return
+
+        reasons = batch.get("reasons")
+        reason_value = self._resolve_interrupt_reason_value(reasons if isinstance(reasons, set) else set())
+        batch_id = str(batch.get("batch_id") or "").strip() or self._next_interrupt_batch_id()
+        text = self._build_interrupt_notice_text(
+            event=event,
+            task_ids=task_ids,
+            reason=reason_value,
+            batch_id=batch_id,
+        )
+        await self._send_plain_message(event, text, purpose="interrupt_notice")
+
+    async def _emit_cached_article_result(
+        self,
+        event: AstrMessageEvent,
+        article: dict,
+        emit_stop_sentinel: bool = True,
+    ):
         article_id = int(article.get("id") or 0)
         article_file = self._ensure_cached_article_file(article)
         if article_file is not None and article_file.is_file():
@@ -2383,7 +2799,11 @@ class ArticleSummaryService(Star):
             text = "文章已缓存，但未提取到可发送文本。"
         yield event.plain_result(text)
         logger.info("[article-summary] hit cache article=%s", article_id)
-        async for item in self._emit_publish_guide_result(event, article_id):
+        async for item in self._emit_publish_guide_result(
+            event,
+            article_id,
+            emit_stop_sentinel=emit_stop_sentinel,
+        ):
             yield item
 
     def _ensure_cached_article_file(self, article: dict) -> Optional[Path]:
@@ -2445,6 +2865,8 @@ class ArticleSummaryService(Star):
 
         async with self._active_codex_lock:
             self._active_codex_tasks.clear()
+        async with self._interrupt_notice_lock:
+            self._group_interrupt_batches.clear()
 
         repo.stop_all_processing(reason)
 
@@ -3916,11 +4338,19 @@ class ArticleSummaryService(Star):
             f"原文章地址：{normalized_url}"
         )
 
-    async def _send_progress_message(self, event: AstrMessageEvent, text: str) -> None:
+    async def _send_plain_message(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        purpose: str = "message",
+    ) -> None:
         try:
             await event.send(MessageChain([Comp.Plain(text)]))
         except Exception as exc:
-            logger.warning("[article-summary] send progress failed: %s", exc)
+            logger.warning("[article-summary] send %s failed: %s", purpose, exc)
+
+    async def _send_progress_message(self, event: AstrMessageEvent, text: str) -> None:
+        await self._send_plain_message(event, text, purpose="progress")
 
     def _tail_file_text(self, path: Path, max_chars: int) -> str:
         if not path.is_file():

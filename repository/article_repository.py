@@ -446,6 +446,49 @@ class ArticleRepository(SQLiteRepositoryBase):
             ).fetchone()
         return self._to_dict(row) or None
 
+    def list_tasks_by_ids_for_owner(
+        self,
+        task_ids: Iterable[int],
+        platform: str,
+        account_id: str,
+    ) -> list[dict]:
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for raw in task_ids:
+            try:
+                task_id = int(raw)
+            except Exception:
+                continue
+            if task_id <= 0 or task_id in seen:
+                continue
+            seen.add(task_id)
+            normalized_ids.append(task_id)
+
+        if not normalized_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT t.id, t.platform, t.account_id, t.article_id, t.status, t.run_dir,
+                       t.session_id, t.pid, t.function_call_count, t.web_search_call_count,
+                       t.token_count, t.progress_report_count, t.last_error, t.created_at, t.updated_at,
+                       a.normalized_url, a.source_url, a.status AS article_status,
+                       a.last_session_id, a.last_error AS article_last_error,
+                       a.article_markdown, a.summary_text, a.article_file_path,
+                       a.owner_platform, a.owner_account_id,
+                       a.publish_status, a.publish_last_error, a.publish_updated_at, a.publish_share_url
+                FROM article_tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.platform = ?
+                  AND t.account_id = ?
+                  AND t.id IN ({placeholders})
+                """,
+                (platform, account_id, *normalized_ids),
+            ).fetchall()
+        return [self._to_dict(row) for row in rows if row is not None]
+
     def get_latest_task_for_article(
         self,
         article_id: int,
