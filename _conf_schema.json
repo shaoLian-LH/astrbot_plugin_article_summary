@@ -70,8 +70,8 @@
   },
   "reaction_emoji_id": {
     "type": "string",
-    "description": "OneBot set_msg_emoji_like 使用的 emoji_id，留空则不打标签",
-    "default": "128077"
+    "description": "OneBot set_msg_emoji_like 使用的 emoji_id（沿用十进制 Unicode code point 写法，例如 👀=128064），留空则不打标签",
+    "default": "128064"
   },
   "prefix": {
     "type": "string",

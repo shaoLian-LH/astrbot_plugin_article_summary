@@ -58,6 +58,10 @@ MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^\)]+\)")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 MULTI_SPACE_PATTERN = re.compile(r"\s+")
 TOML_KV_PATTERN = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*=\s*(.+?)\s*$")
+MARKDOWN_H1_PATTERN = re.compile(r"^\s{0,3}#\s+(.+?)\s*$")
+FILENAME_INVALID_CHAR_PATTERN = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+FILENAME_MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
+DEFAULT_REACTION_EMOJI_ID = str(ord("👀"))
 CODEX_MODEL_KEYS = ("model", "default_model", "chat_model")
 CODEX_REASONING_KEYS = (
     "reasoning_effort",
@@ -3094,9 +3098,14 @@ class ArticleSummaryService(Star):
             run_dir=str(run_dir),
             session_id=session_id,
         )
+        stored_article = repo.get_article_by_id(article_id) or {}
+        sent_file_name = self._build_article_send_file_name_from_article(
+            stored_article,
+            article_markdown=article_markdown,
+        )
 
         yield event.chain_result([
-            Comp.File(file=str(cache_path), name=cache_path.name),
+            Comp.File(file=str(cache_path), name=sent_file_name),
         ])
         yield event.plain_result(outbound_text)
         logger.info(
@@ -3294,8 +3303,18 @@ class ArticleSummaryService(Star):
         article_id = int(article.get("id") or 0)
         article_file = self._ensure_cached_article_file(article)
         if article_file is not None and article_file.is_file():
+            article_markdown = str(article.get("article_markdown") or "")
+            if not article_markdown:
+                try:
+                    article_markdown = article_file.read_text(encoding="utf-8")
+                except Exception:
+                    article_markdown = ""
+            sent_file_name = self._build_article_send_file_name_from_article(
+                article,
+                article_markdown=article_markdown,
+            )
             yield event.chain_result([
-                Comp.File(file=str(article_file), name=article_file.name),
+                Comp.File(file=str(article_file), name=sent_file_name),
             ])
 
         text = str(article.get("summary_text") or "").strip()
@@ -3595,6 +3614,63 @@ class ArticleSummaryService(Star):
             return parsed.netloc
         return f"文章{int(article.get('id') or 0)}"
 
+    def _build_article_send_file_name_from_article(
+        self,
+        article: dict[str, Any],
+        article_markdown: str = "",
+    ) -> str:
+        timestamp = 0
+        for key in ("completed_at", "updated_at", "created_at"):
+            try:
+                timestamp = int(article.get(key) or 0)
+            except Exception:
+                timestamp = 0
+            if timestamp > 0:
+                break
+        return self._build_article_send_file_name(article_markdown, timestamp)
+
+    def _build_article_send_file_name(self, article_markdown: str, timestamp: int = 0) -> str:
+        date_part = self._format_article_send_date(timestamp)
+        title = self._extract_article_h1_title(article_markdown)
+        file_stem = self._sanitize_article_file_stem(title)
+        return f"{date_part}_{file_stem}.md"
+
+    def _format_article_send_date(self, timestamp: int) -> str:
+        try:
+            if int(timestamp) > 0:
+                return datetime.fromtimestamp(int(timestamp)).strftime("%Y_%m_%d")
+        except Exception:
+            pass
+        return datetime.now().strftime("%Y_%m_%d")
+
+    def _extract_article_h1_title(self, markdown: str) -> str:
+        text, _ = self._strip_leading_frontmatter(str(markdown or "").strip())
+        if not text:
+            return ""
+        for raw_line in text.splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            match = MARKDOWN_H1_PATTERN.match(line)
+            if not match:
+                continue
+            heading = re.sub(r"\s+#*\s*$", "", str(match.group(1) or "")).strip()
+            if heading:
+                return heading
+        return ""
+
+    def _sanitize_article_file_stem(self, title: str) -> str:
+        normalized = str(title or "").strip()
+        if not normalized:
+            return "article"
+        normalized = FILENAME_INVALID_CHAR_PATTERN.sub("_", normalized)
+        normalized = MULTI_SPACE_PATTERN.sub(" ", normalized)
+        normalized = FILENAME_MULTI_UNDERSCORE_PATTERN.sub("_", normalized)
+        normalized = normalized.strip(" ._")
+        if not normalized:
+            return "article"
+        return normalized or "article"
+
     def _build_weekly_verify_prompt(self, input_file: Path) -> str:
         payload = {
             "input_file": str(input_file),
@@ -3862,7 +3938,7 @@ class ArticleSummaryService(Star):
             logger.info("[article-summary] reaction skipped reason=disabled")
             return
 
-        emoji_id = self._cfg_str("reaction_emoji_id", "").strip()
+        emoji_id = self._cfg_str("reaction_emoji_id", DEFAULT_REACTION_EMOJI_ID).strip()
         if not emoji_id:
             logger.info("[article-summary] reaction skipped reason=empty_emoji_id")
             return

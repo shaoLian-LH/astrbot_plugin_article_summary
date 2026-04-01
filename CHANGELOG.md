@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.0.24 - 2026-04-01
+
+### Changed
+- 默认消息识别表情从 `👍` 调整为 `👀`，继续沿用十进制 Unicode code point 的 `reaction_emoji_id` 配置写法。
+- “文章获取成功”与“缓存命中回传”发送给群组的 Markdown 文件展示名改为 `${YYYY_MM_DD}_${文章一级标题}.md`；无一级标题时回退为 `${YYYY_MM_DD}_article.md`。
+
+### Fixed
+- 修复发送文件名额外截断到 80 字符的问题，改为仅清洗非法文件名字符，不再静默裁剪标题。
+
 ## v0.0.23 - 2026-03-30
 
 ### Added
