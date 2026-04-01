@@ -92,6 +92,7 @@ CODEX_SUBCOMMANDS = {
 LOG_PREVIEW_LIMIT = 240
 TASK_LIST_MAX_ITEMS = 30
 TASK_LIST_COMPLETED_LIMIT = 10
+ARTICLE_MISSING_FILE_AUTO_RESUME_MAX_RETRY = 1
 PROGRESS_TITLE_SUMMARY = "文章总结中"
 PROGRESS_TITLE_PUBLISH = "文章发布中"
 PROGRESS_TITLE_VERIFY_ACCOUNT = "账户验证中"
@@ -405,6 +406,8 @@ class ArticleSummaryService(Star):
             run_dir=run_dir,
             codex_args=resume_args,
             prompt_preview=f"resume {session_id}",
+            session_id_hint=session_id,
+            allow_missing_article_auto_resume=True,
             emit_stop_sentinel=False,
         ):
             yield item
@@ -3009,6 +3012,8 @@ class ArticleSummaryService(Star):
             run_dir=run_dir,
             codex_args=codex_args,
             prompt_preview=prompt,
+            session_id_hint="",
+            allow_missing_article_auto_resume=False,
         ):
             yield item
 
@@ -3021,43 +3026,94 @@ class ArticleSummaryService(Star):
         run_dir: Path,
         codex_args: list[str],
         prompt_preview: str,
+        session_id_hint: str = "",
+        allow_missing_article_auto_resume: bool = False,
         emit_stop_sentinel: bool = True,
     ):
-        codex_error, session_id, _ = await self._run_codex(
-            event=event,
-            run_dir=run_dir,
-            resolved_args=codex_args,
-            task_id=task_id,
-            article_id=article_id,
-            article_url=source_url,
-            prompt_preview=prompt_preview,
-        )
-        if codex_error:
-            self._mark_task_stopped(task_id, article_id, codex_error, session_id)
-            await self._emit_task_interrupted_notice(
-                event=event,
-                task_id=task_id,
-                reason=self._classify_interrupt_reason(codex_error),
-            )
-            if emit_stop_sentinel:
-                yield self._stop_sentinel_result()
-            return
+        active_args = list(codex_args)
+        active_prompt_preview = str(prompt_preview or "").strip()
+        effective_session_id = str(session_id_hint or "").strip()
+        missing_article_resume_retry = 0
+        article_path: Optional[Path] = None
 
-        article_path = self._find_latest_article(run_dir)
-        if article_path is None:
-            error_text = "未找到 article.md，请检查 Codex 输出。"
-            self._mark_task_stopped(task_id, article_id, error_text, session_id)
-            await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
-            if emit_stop_sentinel:
-                yield self._stop_sentinel_result()
-            return
+        while True:
+            codex_error, run_session_id, _ = await self._run_codex(
+                event=event,
+                run_dir=run_dir,
+                resolved_args=active_args,
+                task_id=task_id,
+                article_id=article_id,
+                article_url=source_url,
+                prompt_preview=active_prompt_preview,
+            )
+            run_session = str(run_session_id or "").strip()
+            if run_session:
+                effective_session_id = run_session
+
+            if codex_error:
+                self._mark_task_stopped(task_id, article_id, codex_error, effective_session_id)
+                await self._emit_task_interrupted_notice(
+                    event=event,
+                    task_id=task_id,
+                    reason=self._classify_interrupt_reason(codex_error),
+                )
+                if emit_stop_sentinel:
+                    yield self._stop_sentinel_result()
+                return
+
+            article_path = self._find_latest_article(run_dir)
+            if article_path is not None:
+                break
+
+            if not allow_missing_article_auto_resume:
+                error_text = "未找到 article.md，请检查 Codex 输出。"
+                self._mark_task_stopped(task_id, article_id, error_text, effective_session_id)
+                await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
+                if emit_stop_sentinel:
+                    yield self._stop_sentinel_result()
+                return
+
+            if not effective_session_id:
+                error_text = "未找到 article.md，且当前任务没有可继续的 session_id，请检查 Codex 输出。"
+                self._mark_task_stopped(task_id, article_id, error_text, effective_session_id)
+                await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
+                if emit_stop_sentinel:
+                    yield self._stop_sentinel_result()
+                return
+
+            if missing_article_resume_retry >= ARTICLE_MISSING_FILE_AUTO_RESUME_MAX_RETRY:
+                error_text = (
+                    "继续获取文章后仍未生成 article.md，"
+                    f"已自动继续 {missing_article_resume_retry} 次，请检查 Codex 输出。"
+                )
+                self._mark_task_stopped(task_id, article_id, error_text, effective_session_id)
+                await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
+                if emit_stop_sentinel:
+                    yield self._stop_sentinel_result()
+                return
+
+            resume_args, resume_error = self._build_resume_codex_args(effective_session_id)
+            if resume_error:
+                error_text = f"未找到 article.md，且无法继续当前会话：{resume_error}"
+                self._mark_task_stopped(task_id, article_id, error_text, effective_session_id)
+                await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
+                if emit_stop_sentinel:
+                    yield self._stop_sentinel_result()
+                return
+
+            missing_article_resume_retry += 1
+            yield event.plain_result(
+                "[article-summary] 未检测到 article.md，正在继续当前 Codex 会话..."
+            )
+            active_args = resume_args
+            active_prompt_preview = f"resume {effective_session_id}"
 
         try:
             article_markdown = article_path.read_text(encoding="utf-8")
         except Exception as exc:
             error_text = f"读取 article.md 失败: {exc}"
             logger.exception("failed to read article.md: %s", exc)
-            self._mark_task_stopped(task_id, article_id, error_text, session_id)
+            self._mark_task_stopped(task_id, article_id, error_text, effective_session_id)
             await self._emit_task_interrupted_notice(event=event, task_id=task_id, reason="unexpected")
             if emit_stop_sentinel:
                 yield self._stop_sentinel_result()
@@ -3091,12 +3147,12 @@ class ArticleSummaryService(Star):
             summary_text=outbound_text,
             article_file_path=str(cache_path),
             run_dir=str(run_dir),
-            session_id=session_id,
+            session_id=effective_session_id,
         )
         repo.complete_tasks_for_article(
             article_id=article_id,
             run_dir=str(run_dir),
-            session_id=session_id,
+            session_id=effective_session_id,
         )
         stored_article = repo.get_article_by_id(article_id) or {}
         sent_file_name = self._build_article_send_file_name_from_article(
