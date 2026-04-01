@@ -98,7 +98,7 @@
     "description": "传给 Codex 的提示词模板，支持 {href} 占位符",
     "editor_mode": true,
     "editor_language": "markdown",
-    "default": "你需要使用 $url-to-markdown 技能去获取 {href} 的内容，如果原文是英文则还需要使用 $translate-non-zh-article 技能去进行翻译"
+    "default": "你需要使用 $url-to-markdown 技能去获取 {href} 的内容，保留默认媒体下载行为，不要使用 --no-download-media，并确保 Markdown 中图片链接保持为相对本地路径；如果原文是英文则还需要使用 $translate-non-zh-article 技能去进行翻译"
   },
   "codex_publish_prompt_template": {
     "type": "text",

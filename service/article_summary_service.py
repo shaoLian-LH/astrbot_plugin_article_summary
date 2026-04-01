@@ -65,6 +65,8 @@ MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^\)]+\)")
 MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^\)]+\)")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 MULTI_SPACE_PATTERN = re.compile(r"\s+")
+MARKDOWN_IMAGE_TARGET_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+HTML_IMAGE_SRC_PATTERN = re.compile(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"'][^>]*>", re.IGNORECASE)
 TOML_KV_PATTERN = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*=\s*(.+?)\s*$")
 MARKDOWN_H1_PATTERN = re.compile(r"^\s{0,3}#\s+(.+?)\s*$")
 FILENAME_INVALID_CHAR_PATTERN = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
@@ -1005,6 +1007,12 @@ class ArticleSummaryService(Star):
         if sanitize_error:
             repo.set_article_publish_failed(target_article_id, sanitize_error)
             yield event.plain_result(f"[article-summary] 发布失败：{sanitize_error}")
+            yield self._stop_sentinel_result()
+            return
+        asset_error = self._validate_publish_article_assets(article_file)
+        if asset_error:
+            repo.set_article_publish_failed(target_article_id, asset_error)
+            yield event.plain_result(f"[article-summary] 发布失败：{asset_error}")
             yield self._stop_sentinel_result()
             return
         self._prepare_codex_workspace_config(run_dir)
@@ -3637,50 +3645,221 @@ class ArticleSummaryService(Star):
             yield item
 
     def _ensure_cached_article_file(self, article: dict) -> Optional[Path]:
-        path_text = str(article.get("article_file_path") or "").strip()
-        if path_text:
-            path = Path(path_text).expanduser()
-            if not path.is_absolute():
-                path = Path.cwd() / path
-            if path.is_file():
-                return path
-
         article_id = int(article.get("id") or 0)
-        markdown = str(article.get("article_markdown") or "")
-        if article_id <= 0 or not markdown:
-            return None
-        return self._write_article_cache_file(article_id, markdown)
+        existing_path = self._resolve_article_file_path(str(article.get("article_file_path") or "").strip())
+        cache_path = self._resolve_article_cache_dir(article_id) / "article.md" if article_id > 0 else None
+        if cache_path is not None and self._article_file_has_complete_local_media(cache_path):
+            return cache_path
+        if existing_path is not None and self._article_file_has_complete_local_media(existing_path):
+            return existing_path
 
-    def _write_article_cache_file(self, article_id: int, article_markdown: str) -> Optional[Path]:
-        try:
-            root = self._resolve_article_cache_root()
-            path = root / f"article-{article_id}" / "article.md"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(article_markdown, encoding="utf-8")
+        source_article_file = self._resolve_fetch_article_file(article) or existing_path
+        if source_article_file is None and cache_path is not None and cache_path.is_file():
+            source_article_file = cache_path
+        markdown = str(article.get("article_markdown") or "")
+        if not markdown and source_article_file is not None and source_article_file.is_file():
+            try:
+                markdown = source_article_file.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning(
+                    "[article-summary] read source article failed for cache repair article=%s path=%s err=%s",
+                    article_id,
+                    source_article_file,
+                    exc,
+                )
+
+        if article_id <= 0 or not markdown.strip():
+            if existing_path is not None and existing_path.is_file():
+                return existing_path
+            if source_article_file is not None and source_article_file.is_file():
+                return source_article_file
+            return None
+        return self._write_article_cache_file(
+            article_id,
+            markdown,
+            source_article_file=source_article_file,
+        )
+
+    def _resolve_article_file_path(self, path_text: str) -> Optional[Path]:
+        text = str(path_text or "").strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if path.is_file():
             return path
+        return None
+
+    def _resolve_fetch_article_file(self, article: dict) -> Optional[Path]:
+        run_dir = self._resolve_run_dir(str(article.get("last_run_dir") or ""))
+        if run_dir is None or not run_dir.is_dir():
+            return None
+        return self._find_latest_article(run_dir)
+
+    def _resolve_article_cache_dir(self, article_id: int) -> Path:
+        return self._resolve_article_cache_root() / f"article-{article_id}"
+
+    def _iter_markdown_local_media_refs(self, markdown: str) -> Iterable[str]:
+        text = str(markdown or "")
+        for match in MARKDOWN_IMAGE_TARGET_PATTERN.findall(text):
+            normalized = self._normalize_local_media_ref(match)
+            if normalized:
+                yield normalized
+        for match in HTML_IMAGE_SRC_PATTERN.findall(text):
+            normalized = self._normalize_local_media_ref(match)
+            if normalized:
+                yield normalized
+
+    def _normalize_local_media_ref(self, raw_ref: str) -> str:
+        text = str(raw_ref or "").strip()
+        if not text:
+            return ""
+        was_bracketed = text.startswith("<") and text.endswith(">")
+        if was_bracketed:
+            text = text[1:-1].strip()
+        if not text:
+            return ""
+        if text.lower().startswith("data:"):
+            return ""
+        if (not was_bracketed) and " " in text:
+            text = text.split(" ", 1)[0].strip()
+        split = urlsplit(text)
+        if split.scheme or split.netloc:
+            return ""
+        path_text = str(split.path or "").strip()
+        if not path_text or path_text.startswith("/"):
+            return ""
+        return path_text
+
+    def _find_missing_local_media_refs(self, markdown: str, base_dir: Path) -> list[str]:
+        missing: list[str] = []
+        seen: set[str] = set()
+        for ref in self._iter_markdown_local_media_refs(markdown):
+            if ref in seen:
+                continue
+            seen.add(ref)
+            if not (base_dir / ref).is_file():
+                missing.append(ref)
+        return missing
+
+    def _article_file_has_complete_local_media(self, article_file: Path) -> bool:
+        if not article_file.is_file():
+            return False
+        try:
+            markdown = article_file.read_text(encoding="utf-8")
+        except Exception:
+            return False
+        return not self._find_missing_local_media_refs(markdown, article_file.parent)
+
+    def _copy_article_supporting_artifacts(self, source_dir: Path, target_dir: Path) -> None:
+        for artifact_name in ("imgs", "videos"):
+            source_path = source_dir / artifact_name
+            if source_path.is_dir():
+                shutil.copytree(source_path, target_dir / artifact_name, dirs_exist_ok=True)
+
+        snapshot_path = source_dir / "article-captured.html"
+        if snapshot_path.is_file():
+            shutil.copy2(snapshot_path, target_dir / snapshot_path.name)
+
+    def _write_article_cache_file(
+        self,
+        article_id: int,
+        article_markdown: str,
+        source_article_file: Optional[Path] = None,
+    ) -> Optional[Path]:
+        cache_dir = self._resolve_article_cache_dir(article_id)
+        temp_dir = cache_dir.parent / f".article-{article_id}-{secrets.token_hex(4)}"
+        try:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            if source_article_file is not None and source_article_file.is_file():
+                self._copy_article_supporting_artifacts(source_article_file.parent, temp_dir)
+            path = temp_dir / "article.md"
+            path.write_text(article_markdown, encoding="utf-8")
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            shutil.move(str(temp_dir), str(cache_dir))
+            return cache_dir / "article.md"
         except Exception as exc:
             logger.warning("[article-summary] write cache article failed article=%s err=%s", article_id, exc)
             return None
+        finally:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _read_article_markdown_for_publish_restore(self, article: dict) -> tuple[str, str]:
+    def _read_article_markdown_for_publish_restore(
+        self,
+        article: dict,
+        reference_article_file: Optional[Path] = None,
+    ) -> tuple[str, str, Optional[Path]]:
         markdown = str(article.get("article_markdown") or "")
-        if markdown.strip():
-            return markdown, "database"
-
         cached_path = self._ensure_cached_article_file(article)
-        if cached_path is None or not cached_path.is_file():
-            return "", ""
+        if cached_path is not None and cached_path.is_file():
+            if self._article_file_has_complete_local_media(cached_path):
+                if markdown.strip():
+                    return markdown, "缓存文件", cached_path
+                try:
+                    return cached_path.read_text(encoding="utf-8"), "缓存文件", cached_path
+                except Exception as exc:
+                    logger.warning(
+                        "[article-summary] read cached article failed for restore article=%s path=%s err=%s",
+                        int(article.get("id") or 0),
+                        cached_path,
+                        exc,
+                    )
+                    if markdown.strip():
+                        return markdown, "数据库", None
 
-        try:
-            return cached_path.read_text(encoding="utf-8"), str(cached_path)
-        except Exception as exc:
-            logger.warning(
-                "[article-summary] read cached article failed for restore article=%s path=%s err=%s",
-                int(article.get("id") or 0),
-                cached_path,
-                exc,
-            )
-            return "", ""
+            if reference_article_file is not None and reference_article_file.is_file():
+                if markdown.strip():
+                    return markdown, str(reference_article_file), reference_article_file
+                try:
+                    return (
+                        reference_article_file.read_text(encoding="utf-8"),
+                        str(reference_article_file),
+                        reference_article_file,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[article-summary] read reference article failed for restore article=%s path=%s err=%s",
+                        int(article.get("id") or 0),
+                        reference_article_file,
+                        exc,
+                    )
+            try:
+                return cached_path.read_text(encoding="utf-8"), str(cached_path), None
+            except Exception as exc:
+                logger.warning(
+                    "[article-summary] read cached article failed for restore article=%s path=%s err=%s",
+                    int(article.get("id") or 0),
+                    cached_path,
+                    exc,
+                )
+                if markdown.strip():
+                    return markdown, "数据库", None
+
+        if markdown.strip():
+            if reference_article_file is not None and reference_article_file.is_file():
+                return markdown, str(reference_article_file), reference_article_file
+            return markdown, "数据库", None
+
+        if reference_article_file is not None and reference_article_file.is_file():
+            try:
+                return (
+                    reference_article_file.read_text(encoding="utf-8"),
+                    str(reference_article_file),
+                    reference_article_file,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[article-summary] read reference article failed for restore article=%s path=%s err=%s",
+                    int(article.get("id") or 0),
+                    reference_article_file,
+                    exc,
+                )
+        return "", "", None
 
     def _select_publish_resume_session(self, article: dict) -> str:
         publish_status = str(article.get("publish_status") or "").strip()
@@ -3698,10 +3877,17 @@ class ArticleSummaryService(Star):
                 return run_dir
         return None
 
-    def _write_publish_workspace_article(self, run_dir: Path, article_markdown: str) -> tuple[Optional[Path], str]:
+    def _write_publish_workspace_article(
+        self,
+        run_dir: Path,
+        article_markdown: str,
+        source_article_file: Optional[Path] = None,
+    ) -> tuple[Optional[Path], str]:
         article_file = run_dir / "article.md"
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
+            if source_article_file is not None and source_article_file.is_file():
+                self._copy_article_supporting_artifacts(source_article_file.parent, run_dir)
             article_file.write_text(article_markdown, encoding="utf-8")
             return article_file, ""
         except Exception as exc:
@@ -3724,7 +3910,10 @@ class ArticleSummaryService(Star):
         if not reference_run_dir_missing and reference_run_dir is not None:
             reference_article_file = self._find_latest_article(reference_run_dir)
 
-        article_markdown, restore_source = self._read_article_markdown_for_publish_restore(article)
+        article_markdown, restore_source, restore_source_file = self._read_article_markdown_for_publish_restore(
+            article,
+            reference_article_file=reference_article_file,
+        )
         if not article_markdown.strip():
             return (
                 None,
@@ -3735,7 +3924,11 @@ class ArticleSummaryService(Star):
             )
 
         target_run_dir = self._create_publish_run_dir(event, article_id)
-        article_file, write_error = self._write_publish_workspace_article(target_run_dir, article_markdown)
+        article_file, write_error = self._write_publish_workspace_article(
+            target_run_dir,
+            article_markdown,
+            source_article_file=restore_source_file,
+        )
         if write_error:
             return None, None, False, "", write_error
 
@@ -3745,7 +3938,12 @@ class ArticleSummaryService(Star):
         if not workspace_restored:
             return target_run_dir, article_file, False, "", ""
 
-        source_label = "数据库" if restore_source == "database" else "缓存文件"
+        if restore_source == "数据库":
+            source_label = "数据库"
+        elif restore_source == "缓存文件":
+            source_label = "缓存文件"
+        else:
+            source_label = "工作空间文件"
         if reference_run_dir_missing or reference_run_dir is None:
             restore_notice = (
                 "[article-summary] 检测到发布工作空间丢失，"
@@ -4682,14 +4880,15 @@ class ArticleSummaryService(Star):
     def _build_codex_prompt(self, href: str) -> str:
         template = self._cfg_str(
             "codex_prompt_template",
-            "你需要使用 $url-to-markdown 技能去获取 {href} 的内容，如果原文是英文则还需要使用 $translate-non-zh-article 技能去进行翻译",
+            "你需要使用 $url-to-markdown 技能去获取 {href} 的内容，保留默认媒体下载行为，不要使用 --no-download-media，并确保 Markdown 中图片链接保持为相对本地路径；如果原文是英文则还需要使用 $translate-non-zh-article 技能去进行翻译",
         )
         try:
             return template.format(href=href)
         except Exception:
             return (
                 "你需要使用 $url-to-markdown 技能去获取 "
-                f"{href} 的内容，如果原文是英文则还需要使用 $translate-non-zh-article 技能去进行翻译"
+                f"{href} 的内容，保留默认媒体下载行为，不要使用 --no-download-media，并确保 Markdown 中图片链接保持为相对本地路径；"
+                "如果原文是英文则还需要使用 $translate-non-zh-article 技能去进行翻译"
             )
 
     def _create_run_dir(self, event: AstrMessageEvent) -> Path:
@@ -5887,6 +6086,31 @@ class ArticleSummaryService(Star):
             )
             return f"写入 article.md 失败：{exc}"
         return ""
+
+    def _validate_publish_article_assets(self, article_file: Path) -> str:
+        try:
+            markdown = article_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "[article-summary] read article.md failed before asset validation path=%s err=%s",
+                article_file,
+                exc,
+            )
+            return f"读取 article.md 失败：{exc}"
+
+        missing_refs = self._find_missing_local_media_refs(markdown, article_file.parent)
+        if not missing_refs:
+            return ""
+
+        preview = "、".join(missing_refs[:5])
+        if len(missing_refs) > 5:
+            preview = f"{preview} 等 {len(missing_refs)} 个文件"
+        logger.warning(
+            "[article-summary] publish workspace missing local media path=%s missing=%s",
+            article_file,
+            missing_refs,
+        )
+        return f"article.md 引用了缺失的本地图片资源：{preview}；请重新获取文章后再发布。"
 
     def _strip_leading_frontmatter(self, markdown: str) -> tuple[str, bool]:
         stripped = FRONTMATTER_PATTERN.sub("", markdown, count=1)
