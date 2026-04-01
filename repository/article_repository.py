@@ -1085,6 +1085,26 @@ class ArticleRepository(SQLiteRepositoryBase):
             "task_deleted": task_deleted,
         }
 
+    def list_task_run_dirs_for_article(self, article_id: int) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_dir
+                FROM article_tasks
+                WHERE article_id = ?
+                  AND run_dir != ''
+                ORDER BY updated_at DESC, id DESC
+                """,
+                (article_id,),
+            ).fetchall()
+
+        run_dirs: list[str] = []
+        for row in rows:
+            run_dir = str((row["run_dir"] if row is not None else "") or "").strip()
+            if run_dir:
+                run_dirs.append(run_dir)
+        return run_dirs
+
     def stop_all_processing(self, last_error: str) -> int:
         now = self._now()
         with self._connect() as conn:

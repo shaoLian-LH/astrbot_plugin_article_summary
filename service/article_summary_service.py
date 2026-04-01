@@ -17,7 +17,11 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult
 from astrbot.api.star import Context, Star
 if __package__ and __package__.count(".") >= 1:
-    from ..infrastructure.sqlite_base import DEFAULT_ARTICLE_CACHE_ROOT, DEFAULT_DB_PATH
+    from ..infrastructure.sqlite_base import (
+        DEFAULT_ARTICLE_CACHE_ROOT,
+        DEFAULT_DB_PATH,
+        DEFAULT_PLUGIN_DATA_ROOT,
+    )
     from ..repository.article_repository import (
         ARTICLE_PUBLISH_STATUS_FAILED,
         ARTICLE_PUBLISH_STATUS_PENDING,
@@ -30,7 +34,11 @@ if __package__ and __package__.count(".") >= 1:
     )
     from ..utils.constants import PLUGIN_NAME, PLUGIN_VERSION
 else:
-    from infrastructure.sqlite_base import DEFAULT_ARTICLE_CACHE_ROOT, DEFAULT_DB_PATH
+    from infrastructure.sqlite_base import (
+        DEFAULT_ARTICLE_CACHE_ROOT,
+        DEFAULT_DB_PATH,
+        DEFAULT_PLUGIN_DATA_ROOT,
+    )
     from repository.article_repository import (
         ARTICLE_PUBLISH_STATUS_FAILED,
         ARTICLE_PUBLISH_STATUS_PENDING,
@@ -196,6 +204,7 @@ PUBLISH_URL_PUBLIC_HOST_DENYLIST = (
     "gitee.com",
     "bitbucket.org",
 )
+DELETE_ARTICLE_ID_SPLIT_PATTERN = re.compile(r"[，,]+")
 
 
 class ArticleSummaryService(Star):
@@ -1111,59 +1120,98 @@ class ArticleSummaryService(Star):
             return
 
         args = self._get_command_args(event, ("删除文章",), [article_id])
-        target_article_id = self._parse_int(args[0] if args else article_id)
-        if target_article_id <= 0:
-            yield event.plain_result("[article-summary] 用法：/删除文章 <文章ID>")
+        target_article_ids, invalid_tokens = self._parse_delete_article_ids(args)
+        if not target_article_ids:
+            lines = ["[article-summary] 用法：/删除文章 <文章ID[,文章ID]>"]
+            if invalid_tokens:
+                lines.append(f"无效文章ID：{', '.join(invalid_tokens)}")
+            yield event.plain_result("\n".join(lines))
             yield self._stop_sentinel_result()
             return
 
         repo = self._ensure_repository()
-        article = repo.get_article_by_id(target_article_id)
-        if article is None:
-            yield event.plain_result(f"[article-summary] 未找到文章 {target_article_id}。")
-            yield self._stop_sentinel_result()
-            return
+        success_lines: list[str] = []
+        partial_lines: list[str] = []
+        failed_lines: list[str] = []
+        total_task_deleted = 0
+        total_path_removed = 0
+        total_path_failed = 0
 
-        owner = repo.resolve_article_owner(target_article_id)
-        if owner is None:
-            yield event.plain_result("[article-summary] 该文章缺少创建者信息，无法执行删除。")
-            yield self._stop_sentinel_result()
-            return
+        for target_article_id in target_article_ids:
+            article = repo.get_article_by_id(target_article_id)
+            if article is None:
+                failed_lines.append(f"- 文章 {target_article_id}：未找到。")
+                continue
 
-        owner_platform = str(owner.get("platform") or "").strip()
-        owner_account = str(owner.get("account_id") or "").strip()
-        if owner_platform != platform or owner_account != account_id:
-            yield event.plain_result("[article-summary] 仅文章创建者可删除该文章缓存。")
-            yield self._stop_sentinel_result()
-            return
+            owner = repo.resolve_article_owner(target_article_id)
+            if owner is None:
+                failed_lines.append(f"- 文章 {target_article_id}：缺少创建者信息，无法删除。")
+                continue
 
-        try:
-            delete_result = repo.delete_article_with_tasks(target_article_id)
-        except Exception as exc:
-            logger.warning("[article-summary] delete article db failed article=%s err=%s", target_article_id, exc)
-            yield event.plain_result(f"[article-summary] 删除失败：数据库删除异常（{exc}）。")
-            yield self._stop_sentinel_result()
-            return
+            owner_platform = str(owner.get("platform") or "").strip()
+            owner_account = str(owner.get("account_id") or "").strip()
+            if owner_platform != platform or owner_account != account_id:
+                failed_lines.append(f"- 文章 {target_article_id}：仅创建者可删除。")
+                continue
 
-        if int(delete_result.get("article_deleted") or 0) <= 0:
-            yield event.plain_result("[article-summary] 删除失败，数据库记录未变更。")
-            yield self._stop_sentinel_result()
-            return
-
-        deleted_files, failed_files = self._remove_article_cache(article)
-        if failed_files > 0:
-            yield event.plain_result(
-                f"[article-summary] 文章 {target_article_id} 的数据库记录已删除，"
-                f"但缓存清理部分失败（成功 {deleted_files} 项，失败 {failed_files} 项）。"
+            task_run_dirs = repo.list_task_run_dirs_for_article(target_article_id)
+            cleanup_candidates = self._collect_article_cleanup_candidates(
+                article=article,
+                task_run_dirs=task_run_dirs,
             )
-            yield self._stop_sentinel_result()
-            return
 
-        yield event.plain_result(
-            f"[article-summary] 已删除文章 {target_article_id}。"
-            f"任务记录删除 {int(delete_result.get('task_deleted') or 0)} 条，"
-            f"缓存清理成功 {deleted_files} 项。"
-        )
+            try:
+                delete_result = repo.delete_article_with_tasks(target_article_id)
+            except Exception as exc:
+                logger.warning("[article-summary] delete article db failed article=%s err=%s", target_article_id, exc)
+                failed_lines.append(f"- 文章 {target_article_id}：数据库删除异常（{exc}）。")
+                continue
+
+            if int(delete_result.get("article_deleted") or 0) <= 0:
+                failed_lines.append(f"- 文章 {target_article_id}：数据库记录未变更。")
+                continue
+
+            deleted_paths, failed_paths, failed_reasons = self._remove_article_paths(cleanup_candidates)
+            task_deleted = int(delete_result.get("task_deleted") or 0)
+            total_task_deleted += task_deleted
+            total_path_removed += deleted_paths
+            total_path_failed += failed_paths
+
+            if failed_paths > 0:
+                reason_preview = "；".join(failed_reasons[:2])
+                if len(failed_reasons) > 2:
+                    reason_preview = f"{reason_preview}；..."
+                partial_lines.append(
+                    f"- 文章 {target_article_id}：记录已删除（任务 {task_deleted} 条），"
+                    f"目录清理成功 {deleted_paths} 项，失败 {failed_paths} 项。"
+                    f"{f' 原因：{reason_preview}' if reason_preview else ''}"
+                )
+                continue
+
+            success_lines.append(
+                f"- 文章 {target_article_id}：已删除（任务 {task_deleted} 条，目录清理 {deleted_paths} 项）。"
+            )
+
+        summary_lines = [
+            "[article-summary] 删除完成："
+            f"请求 {len(target_article_ids)} 个文章ID，"
+            f"成功 {len(success_lines) + len(partial_lines)}，"
+            f"失败 {len(failed_lines) + len(invalid_tokens)}。",
+            f"合计删除任务记录 {total_task_deleted} 条，目录清理成功 {total_path_removed} 项，失败 {total_path_failed} 项。",
+        ]
+        if invalid_tokens:
+            summary_lines.append(f"无效文章ID：{', '.join(invalid_tokens)}")
+        if success_lines:
+            summary_lines.append("成功：")
+            summary_lines.extend(success_lines)
+        if partial_lines:
+            summary_lines.append("部分成功（目录清理有告警）：")
+            summary_lines.extend(partial_lines)
+        if failed_lines:
+            summary_lines.append("失败：")
+            summary_lines.extend(failed_lines)
+
+        yield event.plain_result("\n".join(summary_lines))
         yield self._stop_sentinel_result()
 
     async def on_group_message(self, event: AstrMessageEvent):
@@ -1449,6 +1497,13 @@ class ArticleSummaryService(Star):
             path = Path.cwd() / path
         return path
 
+    def _resolve_work_root(self) -> Path:
+        raw = self._cfg_str("work_root", "article-summary-runs").strip()
+        path = Path(raw) if raw else Path("article-summary-runs")
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
+
     def _ensure_repository(self) -> ArticleRepository:
         if self.article_repo is None:
             self.article_repo = ArticleRepository(db_path=self._resolve_db_path())
@@ -1470,6 +1525,42 @@ class ArticleSummaryService(Star):
             return int(str(value).strip())
         except Exception:
             return 0
+
+    def _parse_delete_article_ids(self, args: list[str]) -> tuple[list[int], list[str]]:
+        normalized_args = [str(item or "").strip() for item in args if str(item or "").strip()]
+        if not normalized_args:
+            return [], []
+
+        merged = " ".join(normalized_args).strip()
+        if not merged:
+            return [], []
+
+        raw_tokens: list[str] = []
+        if DELETE_ARTICLE_ID_SPLIT_PATTERN.search(merged):
+            for chunk in DELETE_ARTICLE_ID_SPLIT_PATTERN.split(merged):
+                text = str(chunk or "").strip()
+                if not text:
+                    continue
+                if " " in text:
+                    raw_tokens.extend(part for part in text.split() if part)
+                else:
+                    raw_tokens.append(text)
+        else:
+            raw_tokens = list(normalized_args)
+
+        seen_ids: set[int] = set()
+        article_ids: list[int] = []
+        invalid_tokens: list[str] = []
+        for token in raw_tokens:
+            article_id = self._parse_int(token)
+            if article_id <= 0:
+                invalid_tokens.append(token)
+                continue
+            if article_id in seen_ids:
+                continue
+            seen_ids.add(article_id)
+            article_ids.append(article_id)
+        return article_ids, invalid_tokens
 
     def _task_status_label(self, status: str) -> str:
         mapping = {
@@ -1505,7 +1596,7 @@ class ArticleSummaryService(Star):
             "5. /默认发布团队 <团队名或代号>\n"
             "6. /默认发布知识库 <知识库名或代号>\n"
             "7. /默认发布 <空间> <团队> <知识库>\n"
-            "8. /删除文章 <文章ID>\n"
+            "8. /删除文章 <文章ID[,文章ID]>\n"
             "9. 知识库账户 <username> <password>（仅私聊，验证成功后保存）\n"
             "10. /每周总结\n"
             "11. /文档总结帮助"
@@ -2480,11 +2571,7 @@ class ArticleSummaryService(Star):
         return path
 
     def _create_task_run_dir(self, event: AstrMessageEvent, task_id: int) -> Path:
-        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
-        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
-        if not work_root.is_absolute():
-            work_root = Path.cwd() / work_root
-
+        work_root = self._resolve_work_root()
         message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = work_root / f"{timestamp}-t{max(0, task_id)}-{message_id}"
@@ -2492,11 +2579,7 @@ class ArticleSummaryService(Star):
         return run_dir
 
     def _create_publish_run_dir(self, event: AstrMessageEvent, article_id: int) -> Path:
-        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
-        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
-        if not work_root.is_absolute():
-            work_root = Path.cwd() / work_root
-
+        work_root = self._resolve_work_root()
         message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = work_root / f"{timestamp}-publish-a{max(0, article_id)}-{message_id}"
@@ -2504,11 +2587,7 @@ class ArticleSummaryService(Star):
         return run_dir
 
     def _create_weekly_summary_run_dir(self, event: AstrMessageEvent, phase: str) -> Path:
-        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
-        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
-        if not work_root.is_absolute():
-            work_root = Path.cwd() / work_root
-
+        work_root = self._resolve_work_root()
         message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         phase_segment = self._safe_segment(str(phase or "summary"))
@@ -2517,11 +2596,7 @@ class ArticleSummaryService(Star):
         return run_dir
 
     def _create_credential_verify_run_dir(self, event: AstrMessageEvent) -> Path:
-        work_root_raw = self._cfg_str("work_root", "article-summary-runs").strip()
-        work_root = Path(work_root_raw) if work_root_raw else Path("article-summary-runs")
-        if not work_root.is_absolute():
-            work_root = Path.cwd() / work_root
-
+        work_root = self._resolve_work_root()
         message_id = self._safe_segment(str(getattr(event.message_obj, "message_id", "msg")))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = work_root / f"{timestamp}-verify-account-{message_id}"
@@ -2877,38 +2952,134 @@ class ArticleSummaryService(Star):
         normalized = str(match.group(0) or "").strip()
         return normalized.rstrip("`")
 
-    def _remove_article_cache(self, article: dict) -> tuple[int, int]:
+    def _resolve_delete_allowed_roots(self) -> list[Path]:
+        roots = [
+            self._resolve_article_cache_root(),
+            self._resolve_work_root(),
+            Path(DEFAULT_PLUGIN_DATA_ROOT),
+        ]
+        deduped: list[Path] = []
+        visited: set[str] = set()
+        for root in roots:
+            absolute_root = root.expanduser()
+            if not absolute_root.is_absolute():
+                absolute_root = Path.cwd() / absolute_root
+            normalized = absolute_root.resolve(strict=False)
+            if normalized.parent == normalized:
+                logger.warning(
+                    "[article-summary] skip dangerous cleanup root root=%s reason=filesystem_root",
+                    normalized,
+                )
+                continue
+            key = str(normalized)
+            if key in visited:
+                continue
+            visited.add(key)
+            deduped.append(normalized)
+        return deduped
+
+    def _is_path_under_root(self, path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except Exception:
+            return False
+
+    def _path_has_symlink_component(self, path: Path) -> bool:
+        current = path.expanduser()
+        while True:
+            try:
+                if current.is_symlink():
+                    return True
+            except Exception:
+                return True
+            parent = current.parent
+            if parent == current:
+                return False
+            current = parent
+
+    def _normalize_cleanup_candidate(
+        self,
+        path: Path,
+        allowed_roots: list[Path],
+    ) -> tuple[Optional[Path], str]:
+        candidate = path.expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        try:
+            normalized = candidate.resolve(strict=False)
+        except Exception as exc:
+            return None, f"{candidate}（路径解析失败：{exc}）"
+
+        if not any(self._is_path_under_root(normalized, root) for root in allowed_roots):
+            return None, f"{candidate}（危险路径：超出允许根目录）"
+        if self._path_has_symlink_component(candidate):
+            return None, f"{candidate}（危险路径：包含符号链接）"
+        return normalized, ""
+
+    def _collect_article_cleanup_candidates(self, article: dict, task_run_dirs: Iterable[str]) -> list[Path]:
+        article_id = int(article.get("id") or 0)
+        candidates: list[Path] = [self._resolve_article_cache_root() / f"article-{article_id}"]
+
+        dynamic_paths: list[str] = [
+            str(article.get("article_file_path") or "").strip(),
+            str(article.get("last_run_dir") or "").strip(),
+            str(article.get("publish_last_run_dir") or "").strip(),
+        ]
+        dynamic_paths.extend(str(item or "").strip() for item in task_run_dirs)
+
+        for path_text in dynamic_paths:
+            if not path_text:
+                continue
+            path = self._resolve_run_dir(path_text)
+            if path is not None:
+                candidates.append(path)
+        return candidates
+
+    def _remove_article_paths(self, candidates: Iterable[Path]) -> tuple[int, int, list[str]]:
         removed = 0
         failed = 0
-
-        article_id = int(article.get("id") or 0)
-        cache_root_dir = self._resolve_article_cache_root() / f"article-{article_id}"
-
-        candidates: list[Path] = [cache_root_dir]
-        file_path = str(article.get("article_file_path") or "").strip()
-        if file_path:
-            path = Path(file_path).expanduser()
-            if not path.is_absolute():
-                path = Path.cwd() / path
-            candidates.append(path)
-
+        failed_reasons: list[str] = []
+        allowed_roots = self._resolve_delete_allowed_roots()
         visited: set[str] = set()
-        for path in candidates:
-            normalized = str(path.resolve(strict=False))
-            if normalized in visited:
+
+        for raw_path in candidates:
+            normalized_path, validation_error = self._normalize_cleanup_candidate(raw_path, allowed_roots)
+            if normalized_path is None:
+                failed += 1
+                failed_reasons.append(validation_error)
+                logger.warning(
+                    "[article-summary] skip dangerous cleanup path path=%s reason=%s",
+                    raw_path,
+                    validation_error,
+                )
                 continue
-            visited.add(normalized)
-            if not path.exists():
+
+            dedupe_key = str(normalized_path)
+            if dedupe_key in visited:
                 continue
+            visited.add(dedupe_key)
+
+            if not normalized_path.exists():
+                continue
+
             try:
-                if path.is_dir():
-                    shutil.rmtree(path)
+                if normalized_path.is_symlink():
+                    raise RuntimeError("危险路径：包含符号链接")
+                if normalized_path.is_dir():
+                    shutil.rmtree(normalized_path)
                 else:
-                    path.unlink()
+                    normalized_path.unlink()
                 removed += 1
             except Exception as exc:
-                logger.warning("[article-summary] remove cache failed path=%s err=%s", path, exc)
                 failed += 1
+                failed_reasons.append(f"{normalized_path}（{exc}）")
+                logger.warning("[article-summary] remove path failed path=%s err=%s", normalized_path, exc)
+        return removed, failed, failed_reasons
+
+    def _remove_article_cache(self, article: dict) -> tuple[int, int]:
+        candidates = self._collect_article_cleanup_candidates(article, [])
+        removed, failed, _ = self._remove_article_paths(candidates)
         return removed, failed
 
     def _normalize_url(self, href: str) -> str:
