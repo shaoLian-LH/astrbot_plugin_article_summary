@@ -890,12 +890,6 @@ class ArticleSummaryService(Star):
             yield self._stop_sentinel_result()
             return
 
-        article_file = self._ensure_cached_article_file(article)
-        if article_file is None or not article_file.is_file():
-            yield event.plain_result("[article-summary] 未找到 article.md 缓存文件，无法发布。")
-            yield self._stop_sentinel_result()
-            return
-
         defaults = repo.get_user_publish_defaults(platform, account_id) or {}
         cmd_space, cmd_team, cmd_kb, parse_error = self._resolve_publish_command_targets(
             defaults=defaults,
@@ -981,23 +975,23 @@ class ArticleSummaryService(Star):
         team = safe_team
         knowledge_base = safe_knowledge_base
 
-        run_dir_text = str(article.get("last_run_dir") or "").strip()
-        run_dir = self._resolve_run_dir(run_dir_text)
-        if run_dir is None or not run_dir.is_dir():
-            run_dir_display = run_dir_text or "-"
-            run_dir_error = (
-                "该文章缺少可复用的抓取工作空间"
-                f"（last_run_dir={run_dir_display}），请重新获取文章后再发布。"
-            )
+        run_dir, article_file, workspace_restored, restore_notice, restore_error = (
+            self._ensure_publish_workspace(event, article)
+        )
+        if restore_error:
+            repo.set_article_publish_failed(target_article_id, restore_error)
+            yield event.plain_result(f"[article-summary] 发布失败：{restore_error}")
+            yield self._stop_sentinel_result()
+            return
+        if run_dir is None or article_file is None or not article_file.is_file():
+            run_dir_error = "未找到可用的发布工作空间 article.md，无法发布。"
             repo.set_article_publish_failed(target_article_id, run_dir_error)
             yield event.plain_result(f"[article-summary] 发布失败：{run_dir_error}")
             yield self._stop_sentinel_result()
             return
-        logger.info(
-            "[article-summary] publish reuse run_dir article=%s run_dir=%s",
-            target_article_id,
-            run_dir,
-        )
+        if restore_notice:
+            yield event.plain_result(restore_notice)
+
         sanitize_error = self._strip_frontmatter_for_publish(article_file)
         if sanitize_error:
             repo.set_article_publish_failed(target_article_id, sanitize_error)
@@ -1021,22 +1015,89 @@ class ArticleSummaryService(Star):
             yield self._stop_sentinel_result()
             return
 
-        start_text = (
-            f"[article-summary] 正在发布文章 {target_article_id} "
-            f"到空间[{space}] / 团队[{team}] / 知识库[{knowledge_base}] ..."
-        )
         publish_target_text = f"空间[{space}] / 团队[{team}] / 知识库[{knowledge_base}]"
+        resume_session_id = self._select_publish_resume_session(article)
+        repo.update_article_publish_context(
+            target_article_id,
+            run_dir=str(run_dir),
+            session_id=resume_session_id if resume_session_id else "",
+        )
+        primary_codex_args = list(codex_args)
+        primary_prompt_preview = prompt
+        primary_session_id_hint = ""
+        fallback_codex_args: Optional[list[str]] = None
+        fallback_prompt_preview = ""
+        fallback_notice_text = ""
+        if resume_session_id:
+            resume_args, resume_error = self._build_resume_codex_args(resume_session_id)
+            if resume_error:
+                resume_build_error = (
+                    "检测到该文章存在待恢复的旧发布会话，但无法构建继续命令："
+                    f"{resume_error}。为避免重复发文，本次未自动重新发布。"
+                )
+                logger.warning(
+                    "[article-summary] build publish resume args failed article=%s session=%s err=%s",
+                    target_article_id,
+                    resume_session_id,
+                    resume_error,
+                )
+                repo.set_article_publish_failed(target_article_id, resume_build_error)
+                yield event.plain_result(f"[article-summary] 发布失败：{resume_build_error}")
+                yield self._stop_sentinel_result()
+                return
+            else:
+                resume_instruction = self._build_publish_resume_instruction(
+                    article_file_name=article_file.name,
+                )
+                primary_codex_args = self._inject_publish_resume_instruction(
+                    resume_args,
+                    session_id=resume_session_id,
+                    instruction=resume_instruction,
+                )
+                primary_prompt_preview = f"resume {resume_session_id} {resume_instruction}"
+                primary_session_id_hint = resume_session_id
+                fallback_codex_args = list(codex_args)
+                fallback_prompt_preview = prompt
+                fallback_notice_text = (
+                    "[article-summary] 旧发布会话不可继续或未产出可信结果，"
+                    "正在改用新的发布工作空间重新发布..."
+                )
+
+        if workspace_restored and primary_session_id_hint:
+            start_text = (
+                f"[article-summary] 已恢复文章 {target_article_id} 的发布工作空间，"
+                f"正在优先继续旧发布会话并发布到{publish_target_text} ..."
+            )
+        elif primary_session_id_hint:
+            start_text = (
+                f"[article-summary] 检测到文章 {target_article_id} 存在待继续的旧发布会话，"
+                f"正在优先继续并发布到{publish_target_text} ..."
+            )
+        elif workspace_restored:
+            start_text = (
+                f"[article-summary] 已恢复文章 {target_article_id} 的发布工作空间，"
+                f"正在发布到{publish_target_text} ..."
+            )
+        else:
+            start_text = (
+                f"[article-summary] 正在发布文章 {target_article_id} "
+                f"到{publish_target_text} ..."
+            )
+
         async for item in self._run_publish_codex_and_emit_result(
             event=event,
             target_article_id=target_article_id,
             run_dir=run_dir,
-            codex_args=codex_args,
-            prompt_preview=prompt,
+            codex_args=primary_codex_args,
+            prompt_preview=primary_prompt_preview,
             defaults=defaults,
             publish_target_text=publish_target_text,
             start_text=start_text,
-            session_id_hint="",
+            session_id_hint=primary_session_id_hint,
             article_url=str(article.get("source_url") or article.get("normalized_url") or ""),
+            fallback_codex_args=fallback_codex_args,
+            fallback_prompt_preview=fallback_prompt_preview,
+            fallback_notice_text=fallback_notice_text,
         ):
             yield item
         return
@@ -1839,11 +1900,21 @@ class ArticleSummaryService(Star):
         extra_instruction = str(match.group("extra") or "").strip()
         return True, extra_instruction
 
-    def _build_publish_resume_instruction(self, extra_instruction: str = "") -> str:
+    def _build_publish_resume_instruction(
+        self,
+        extra_instruction: str = "",
+        article_file_name: str = "",
+    ) -> str:
+        sections = [PUBLISH_RESUME_PROMPT_BASE]
+        normalized_article_file_name = str(article_file_name or "").strip()
+        if normalized_article_file_name:
+            sections.append(
+                f"若历史文章路径已失效，请改用当前工作目录下的 {normalized_article_file_name} 作为文章源文件。"
+            )
         extra = str(extra_instruction or "").strip()
-        if not extra:
-            return PUBLISH_RESUME_PROMPT_BASE
-        return f"{PUBLISH_RESUME_PROMPT_BASE} 额外要求：{extra}"
+        if extra:
+            sections.append(f"额外要求：{extra}")
+        return " ".join(section for section in sections if section)
 
     def _inject_publish_resume_instruction(
         self,
@@ -2132,13 +2203,13 @@ class ArticleSummaryService(Star):
                 fetched_reply_payload,
             )
 
-        run_dir = self._resolve_run_dir(str(article.get("last_run_dir") or ""))
+        run_dir = self._resolve_publish_resume_run_dir(article)
         if run_dir is None or not run_dir.is_dir():
             return (
                 {
                     "error": (
-                        "[article-summary] 该文章缺少可复用的抓取工作空间，"
-                        "请重新获取文章后再发布。"
+                        "[article-summary] 该文章缺少可复用的发布工作空间，"
+                        "请重新执行 /发布文章 后再试。"
                     ),
                 },
                 fetched_reply_payload,
@@ -3420,6 +3491,108 @@ class ArticleSummaryService(Star):
             logger.warning("[article-summary] write cache article failed article=%s err=%s", article_id, exc)
             return None
 
+    def _read_article_markdown_for_publish_restore(self, article: dict) -> tuple[str, str]:
+        markdown = str(article.get("article_markdown") or "")
+        if markdown.strip():
+            return markdown, "database"
+
+        cached_path = self._ensure_cached_article_file(article)
+        if cached_path is None or not cached_path.is_file():
+            return "", ""
+
+        try:
+            return cached_path.read_text(encoding="utf-8"), str(cached_path)
+        except Exception as exc:
+            logger.warning(
+                "[article-summary] read cached article failed for restore article=%s path=%s err=%s",
+                int(article.get("id") or 0),
+                cached_path,
+                exc,
+            )
+            return "", ""
+
+    def _select_publish_resume_session(self, article: dict) -> str:
+        publish_status = str(article.get("publish_status") or "").strip()
+        if publish_status != ARTICLE_PUBLISH_STATUS_FAILED:
+            return ""
+        return str(article.get("publish_last_session_id") or "").strip()
+
+    def _resolve_publish_resume_run_dir(self, article: dict) -> Optional[Path]:
+        return self._resolve_run_dir(str(article.get("publish_last_run_dir") or ""))
+
+    def _resolve_publish_log_run_dir(self, article: dict) -> Optional[Path]:
+        for field_name in ("publish_last_run_dir", "last_run_dir"):
+            run_dir = self._resolve_run_dir(str(article.get(field_name) or ""))
+            if run_dir is not None:
+                return run_dir
+        return None
+
+    def _write_publish_workspace_article(self, run_dir: Path, article_markdown: str) -> tuple[Optional[Path], str]:
+        article_file = run_dir / "article.md"
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            article_file.write_text(article_markdown, encoding="utf-8")
+            return article_file, ""
+        except Exception as exc:
+            logger.warning(
+                "[article-summary] write publish workspace article failed run_dir=%s err=%s",
+                run_dir,
+                exc,
+            )
+            return None, f"写入发布工作空间 article.md 失败：{exc}"
+
+    def _ensure_publish_workspace(
+        self,
+        event: AstrMessageEvent,
+        article: dict,
+    ) -> tuple[Optional[Path], Optional[Path], bool, str, str]:
+        article_id = int(article.get("id") or 0)
+        reference_run_dir = self._resolve_publish_log_run_dir(article)
+        reference_article_file: Optional[Path] = None
+        reference_run_dir_missing = reference_run_dir is None or not reference_run_dir.is_dir()
+        if not reference_run_dir_missing and reference_run_dir is not None:
+            reference_article_file = self._find_latest_article(reference_run_dir)
+
+        article_markdown, restore_source = self._read_article_markdown_for_publish_restore(article)
+        if not article_markdown.strip():
+            return (
+                None,
+                None,
+                False,
+                "",
+                "该文章缺少可恢复的 article.md 内容，请重新获取文章后再发布。",
+            )
+
+        target_run_dir = self._create_publish_run_dir(event, article_id)
+        article_file, write_error = self._write_publish_workspace_article(target_run_dir, article_markdown)
+        if write_error:
+            return None, None, False, "", write_error
+
+        self._prepare_codex_workspace_config(target_run_dir)
+        self._ensure_repository().update_article_publish_context(article_id, run_dir=str(target_run_dir))
+        workspace_restored = reference_run_dir_missing or reference_article_file is None
+        if not workspace_restored:
+            return target_run_dir, article_file, False, "", ""
+
+        source_label = "数据库" if restore_source == "database" else "缓存文件"
+        if reference_run_dir_missing or reference_run_dir is None:
+            restore_notice = (
+                "[article-summary] 检测到发布工作空间丢失，"
+                f"已基于{source_label}在新工作空间中恢复 article.md。"
+            )
+        else:
+            restore_notice = (
+                "[article-summary] 检测到发布工作空间缺少 article.md，"
+                f"已基于{source_label}在新工作空间中重建 article.md。"
+            )
+        logger.info(
+            "[article-summary] restored publish workspace article=%s run_dir=%s source=%s",
+            article_id,
+            target_run_dir,
+            restore_source or "-",
+        )
+        return target_run_dir, article_file, True, restore_notice, ""
+
     async def _stop_all_running_codex(self, reason: str) -> None:
         repo = self._ensure_repository()
         async with self._active_codex_lock:
@@ -3595,7 +3768,7 @@ class ArticleSummaryService(Star):
 
             raw_url = str(article.get("publish_share_url") or "").strip()
             if not raw_url:
-                run_dir = self._resolve_run_dir(str(article.get("last_run_dir") or ""))
+                run_dir = self._resolve_publish_log_run_dir(article)
                 if run_dir and run_dir.is_dir():
                     extracted = self._extract_first_publish_url(run_dir)
                     if extracted:
@@ -5116,6 +5289,37 @@ class ArticleSummaryService(Star):
         )
         return bool(has_image_hint and has_failure_hint)
 
+    def _looks_like_publish_resume_session_failure(self, failure_reason: str) -> bool:
+        normalized = str(failure_reason or "").strip().lower()
+        if not normalized:
+            return False
+
+        session_markers = (
+            "session",
+            "resume",
+            "conversation",
+            "会话",
+            "续跑",
+            "恢复",
+        )
+        failure_markers = (
+            "not found",
+            "no such",
+            "invalid",
+            "unknown",
+            "does not exist",
+            "expired",
+            "不存在",
+            "找不到",
+            "无效",
+            "失效",
+            "过期",
+        )
+        return bool(
+            any(marker in normalized for marker in session_markers)
+            and any(marker in normalized for marker in failure_markers)
+        )
+
     def _build_publish_auto_retry_instruction(self, retry_round: int, max_retry: int) -> str:
         round_value = max(1, int(retry_round))
         max_value = max(1, int(max_retry))
@@ -5237,24 +5441,17 @@ class ArticleSummaryService(Star):
                 return message
         return ""
 
-    async def _run_publish_codex_and_emit_result(
+    async def _execute_publish_codex_attempt(
         self,
         event: AstrMessageEvent,
         target_article_id: int,
         run_dir: Path,
         codex_args: list[str],
         prompt_preview: str,
-        defaults: dict[str, Any],
-        publish_target_text: str,
-        start_text: str,
         session_id_hint: str = "",
         article_url: str = "",
-    ):
-        repo = self._ensure_repository()
+    ) -> dict[str, Any]:
         temp_task_id = self._next_ephemeral_codex_task_id()
-        if start_text:
-            yield event.plain_result(start_text)
-
         max_retry = 2
         retry_round = 0
         active_args = list(codex_args)
@@ -5265,6 +5462,8 @@ class ArticleSummaryService(Star):
         task_complete_message = ""
         failure_diag = ""
         share_url = ""
+        notices: list[str] = []
+        repo = self._ensure_repository()
 
         while True:
             run_started_at = datetime.now().timestamp()
@@ -5284,6 +5483,11 @@ class ArticleSummaryService(Star):
             run_session = str(run_session_id or "").strip()
             if run_session:
                 effective_session_id = run_session
+                repo.update_article_publish_context(
+                    target_article_id,
+                    run_dir=str(run_dir),
+                    session_id=effective_session_id,
+                )
 
             task_complete_message = self._extract_publish_task_complete_message(
                 run_dir=run_dir,
@@ -5328,17 +5532,107 @@ class ArticleSummaryService(Star):
                 instruction=retry_instruction,
             )
             active_prompt_preview = f"resume {effective_session_id} {retry_instruction}"
-            yield event.plain_result(
+            notices.append(
                 "[article-summary] 检测到图片上传失败，"
                 f"正在自动重试发布（第 {retry_round}/{max_retry} 次）..."
             )
+
+        if not share_url and not failure_reason:
+            failure_reason = "发布失败，未获得可用结果。"
+        if not share_url and retry_round > 0:
+            failure_reason = f"{failure_reason}（已自动重试 {retry_round} 次）"
+
+        return {
+            "share_url": share_url,
+            "failure_reason": failure_reason,
+            "task_complete_message": task_complete_message,
+            "failure_diag": failure_diag,
+            "retry_round": retry_round,
+            "session_id": effective_session_id,
+            "notices": notices,
+        }
+
+    async def _run_publish_codex_and_emit_result(
+        self,
+        event: AstrMessageEvent,
+        target_article_id: int,
+        run_dir: Path,
+        codex_args: list[str],
+        prompt_preview: str,
+        defaults: dict[str, Any],
+        publish_target_text: str,
+        start_text: str,
+        session_id_hint: str = "",
+        article_url: str = "",
+        fallback_codex_args: Optional[list[str]] = None,
+        fallback_prompt_preview: str = "",
+        fallback_notice_text: str = "",
+    ):
+        repo = self._ensure_repository()
+        if start_text:
+            yield event.plain_result(start_text)
+
+        repo.update_article_publish_context(
+            target_article_id,
+            run_dir=str(run_dir),
+            session_id=session_id_hint if session_id_hint else "",
+        )
+        result = await self._execute_publish_codex_attempt(
+            event=event,
+            target_article_id=target_article_id,
+            run_dir=run_dir,
+            codex_args=codex_args,
+            prompt_preview=prompt_preview,
+            session_id_hint=session_id_hint,
+            article_url=article_url,
+        )
+        for notice_text in list(result.get("notices") or []):
+            yield event.plain_result(str(notice_text))
+
+        if not result.get("share_url") and fallback_codex_args:
+            fallback_reason = str(result.get("failure_reason") or "").strip()
+            if self._looks_like_publish_resume_session_failure(fallback_reason):
+                if not fallback_notice_text:
+                    fallback_notice_text = "[article-summary] 旧发布会话不可继续，正在改用新的发布工作空间重新发布..."
+                yield event.plain_result(fallback_notice_text)
+                repo.update_article_publish_context(
+                    target_article_id,
+                    run_dir=str(run_dir),
+                    session_id="",
+                )
+                result = await self._execute_publish_codex_attempt(
+                    event=event,
+                    target_article_id=target_article_id,
+                    run_dir=run_dir,
+                    codex_args=fallback_codex_args,
+                    prompt_preview=fallback_prompt_preview or prompt_preview,
+                    session_id_hint="",
+                    article_url=article_url,
+                )
+                for notice_text in list(result.get("notices") or []):
+                    yield event.plain_result(str(notice_text))
+            else:
+                safe_reason = fallback_reason or "旧发布会话未返回可信结果。"
+                result["failure_reason"] = (
+                    f"{safe_reason}（已停止自动重新发布，避免重复发文）"
+                )
+
+        share_url = str(result.get("share_url") or "").strip()
+        failure_reason = str(result.get("failure_reason") or "").strip()
+        task_complete_message = str(result.get("task_complete_message") or "").strip()
+        failure_diag = str(result.get("failure_diag") or "").strip()
+        effective_session_id = str(result.get("session_id") or "").strip()
+        retry_round = max(0, int(result.get("retry_round") or 0))
+        repo.update_article_publish_context(
+            target_article_id,
+            run_dir=str(run_dir),
+            session_id=effective_session_id if effective_session_id else "",
+        )
 
         if not share_url:
             if not failure_reason:
                 failure_reason = "发布失败，未获得可用结果。"
             final_reason = failure_reason
-            if retry_round > 0:
-                final_reason = f"{failure_reason}（已自动重试 {retry_round} 次）"
             repo.set_article_publish_failed(target_article_id, final_reason)
             token_platform, token_account_id = self._resolve_user_scope(event)
             resume_token = await self._issue_publish_resume_token(

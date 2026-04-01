@@ -45,6 +45,8 @@ class ArticleRepository(SQLiteRepositoryBase):
                 publish_last_error TEXT NOT NULL DEFAULT '',
                 publish_updated_at INTEGER NOT NULL DEFAULT 0,
                 publish_share_url TEXT NOT NULL DEFAULT '',
+                publish_last_session_id TEXT NOT NULL DEFAULT '',
+                publish_last_run_dir TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
                 last_session_id TEXT NOT NULL DEFAULT '',
                 last_run_dir TEXT NOT NULL DEFAULT '',
@@ -111,6 +113,10 @@ class ArticleRepository(SQLiteRepositoryBase):
             conn.execute("ALTER TABLE articles ADD COLUMN publish_updated_at INTEGER NOT NULL DEFAULT 0")
         if not self._column_exists(conn, "articles", "publish_share_url"):
             conn.execute("ALTER TABLE articles ADD COLUMN publish_share_url TEXT NOT NULL DEFAULT ''")
+        if not self._column_exists(conn, "articles", "publish_last_session_id"):
+            conn.execute("ALTER TABLE articles ADD COLUMN publish_last_session_id TEXT NOT NULL DEFAULT ''")
+        if not self._column_exists(conn, "articles", "publish_last_run_dir"):
+            conn.execute("ALTER TABLE articles ADD COLUMN publish_last_run_dir TEXT NOT NULL DEFAULT ''")
         if not self._column_exists(conn, "articles", "last_session_id"):
             conn.execute("ALTER TABLE articles ADD COLUMN last_session_id TEXT NOT NULL DEFAULT ''")
         if not self._column_exists(conn, "articles", "last_run_dir"):
@@ -179,6 +185,7 @@ class ArticleRepository(SQLiteRepositoryBase):
                 SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
                        summary_text, article_file_path, owner_platform, owner_account_id,
                        publish_status, publish_last_error, publish_updated_at, publish_share_url,
+                       publish_last_session_id, publish_last_run_dir,
                        last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 FROM articles
                 WHERE id = ?
@@ -194,6 +201,7 @@ class ArticleRepository(SQLiteRepositoryBase):
                 SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
                        summary_text, article_file_path, owner_platform, owner_account_id,
                        publish_status, publish_last_error, publish_updated_at, publish_share_url,
+                       publish_last_session_id, publish_last_run_dir,
                        last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 FROM articles
                 WHERE normalized_url = ?
@@ -217,9 +225,10 @@ class ArticleRepository(SQLiteRepositoryBase):
                     normalized_url, source_url, status, article_markdown, article_plain_text,
                     summary_text, article_file_path, owner_platform, owner_account_id,
                     publish_status, publish_last_error, publish_updated_at, publish_share_url,
+                    publish_last_session_id, publish_last_run_dir,
                     last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 )
-                VALUES (?, ?, 'pending', '', '', '', '', ?, ?, 'pending', '', ?, '', '', '', '', ?, ?, 0)
+                VALUES (?, ?, 'pending', '', '', '', '', ?, ?, 'pending', '', ?, '', '', '', '', '', '', ?, ?, 0)
                 """,
                 (normalized_url, source_url, owner_platform, owner_account_id, now, now, now),
             )
@@ -237,6 +246,7 @@ class ArticleRepository(SQLiteRepositoryBase):
                 SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
                        summary_text, article_file_path, owner_platform, owner_account_id,
                        publish_status, publish_last_error, publish_updated_at, publish_share_url,
+                       publish_last_session_id, publish_last_run_dir,
                        last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 FROM articles
                 WHERE normalized_url = ?
@@ -308,6 +318,8 @@ class ArticleRepository(SQLiteRepositoryBase):
                     publish_last_error = '',
                     publish_updated_at = ?,
                     publish_share_url = '',
+                    publish_last_session_id = '',
+                    publish_last_run_dir = '',
                     last_run_dir = ?,
                     last_session_id = ?,
                     last_error = '',
@@ -328,6 +340,50 @@ class ArticleRepository(SQLiteRepositoryBase):
                     now,
                     article_id,
                 ),
+            )
+
+    def update_article_last_run_dir(self, article_id: int, run_dir: str) -> None:
+        normalized_run_dir = str(run_dir or "").strip()
+        if not normalized_run_dir:
+            return
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET last_run_dir = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized_run_dir, now, article_id),
+            )
+
+    def update_article_publish_context(
+        self,
+        article_id: int,
+        run_dir: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        if run_dir is None and session_id is None:
+            return
+
+        now = self._now()
+        fields = ["updated_at = ?"]
+        params: list[object] = [now]
+
+        if run_dir is not None:
+            fields.append("publish_last_run_dir = ?")
+            params.append(str(run_dir or "").strip())
+        if session_id is not None:
+            fields.append("publish_last_session_id = ?")
+            params.append(str(session_id or "").strip())
+
+        params.append(int(article_id))
+        set_sql = ", ".join(fields)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE articles SET {set_sql} WHERE id = ?",
+                params,
             )
 
     def set_article_publish_failed(self, article_id: int, last_error: str) -> None:
@@ -437,7 +493,8 @@ class ArticleRepository(SQLiteRepositoryBase):
                        a.last_session_id, a.last_error AS article_last_error,
                        a.article_markdown, a.summary_text, a.article_file_path,
                        a.owner_platform, a.owner_account_id,
-                       a.publish_status, a.publish_last_error, a.publish_updated_at, a.publish_share_url
+                       a.publish_status, a.publish_last_error, a.publish_updated_at, a.publish_share_url,
+                       a.publish_last_session_id, a.publish_last_run_dir
                 FROM article_tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ? AND t.platform = ? AND t.account_id = ?
@@ -478,7 +535,8 @@ class ArticleRepository(SQLiteRepositoryBase):
                        a.last_session_id, a.last_error AS article_last_error,
                        a.article_markdown, a.summary_text, a.article_file_path,
                        a.owner_platform, a.owner_account_id,
-                       a.publish_status, a.publish_last_error, a.publish_updated_at, a.publish_share_url
+                       a.publish_status, a.publish_last_error, a.publish_updated_at, a.publish_share_url,
+                       a.publish_last_session_id, a.publish_last_run_dir
                 FROM article_tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.platform = ?
@@ -824,6 +882,7 @@ class ArticleRepository(SQLiteRepositoryBase):
                 SELECT id, normalized_url, source_url, status, article_markdown, article_plain_text,
                        summary_text, article_file_path, owner_platform, owner_account_id,
                        publish_status, publish_last_error, publish_updated_at, publish_share_url,
+                       publish_last_session_id, publish_last_run_dir,
                        last_error, last_session_id, last_run_dir, created_at, updated_at, completed_at
                 FROM articles
                 WHERE publish_status = ?
