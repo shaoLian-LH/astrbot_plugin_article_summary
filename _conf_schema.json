@@ -81,7 +81,7 @@
   "work_root": {
     "type": "string",
     "description": "运行目录根路径（相对路径会基于 AstrBot 运行时目录解析）",
-    "default": "article-summary-runs"
+    "default": "/data/article-summary-runs"
   },
   "db_path": {
     "type": "string",
